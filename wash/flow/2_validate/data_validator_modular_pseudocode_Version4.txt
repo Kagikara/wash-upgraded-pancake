@@ -1,0 +1,253 @@
+// =====================================================
+// 第五类：市场微观结构与可交易性 (Market Microstructure)
+// =====================================================
+
+// 1) 涨跌停板限制（可交易性问题）
+class LimitUpDownRule implements Rule:
+    name = "LimitUpDownRule"
+    category = "Microstructure"
+
+    function validate(records, context):
+        issues = []
+        grouped = group_by_ticker(records)
+        for ticker, rows in grouped:
+            sorted_rows = sort_by_date(rows)
+            prev_close = None
+            for row in sorted_rows:
+                if prev_close is not None:
+                    limit = context.market_rules.price_limit(ticker, row.date) // 10% or 5% for ST
+                    if abs(row.close - prev_close) / prev_close > limit:
+                        issues.append(Issue(
+                            type="PRICE_LIMIT_EXCEEDED",
+                            category=category,
+                            ticker=ticker,
+                            date=row.date,
+                            field="close",
+                            value=row.close,
+                            detail="Close exceeds price limit rule"
+                        ))
+                prev_close = row.close
+        return issues
+
+
+// 2) 成交量为 0 但价格发生位移
+class ZeroVolumePriceMoveRule implements Rule:
+    name = "ZeroVolumePriceMoveRule"
+    category = "Microstructure"
+
+    function validate(records, context):
+        issues = []
+        grouped = group_by_ticker(records)
+        for ticker, rows in grouped:
+            sorted_rows = sort_by_date(rows)
+            prev_close = None
+            for row in sorted_rows:
+                if prev_close is not None and row.volume == 0:
+                    if row.open != prev_close or row.close != prev_close or
+                       row.high != prev_close or row.low != prev_close:
+                        issues.append(Issue(
+                            type="VOLUME_ZERO_PRICE_MOVED",
+                            category=category,
+                            ticker=ticker,
+                            date=row.date,
+                            field="volume",
+                            value=row.volume,
+                            detail="Price moved despite zero volume"
+                        ))
+                prev_close = row.close
+        return issues
+
+
+// 3) 大宗交易污染
+class BlockTradeContaminationRule implements Rule:
+    name = "BlockTradeContaminationRule"
+    category = "Microstructure"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.market_rules.is_block_trade_included(row.ticker, row.date):
+                issues.append(Issue(
+                    type="BLOCK_TRADE_CONTAMINATION",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="price",
+                    value=extract_price_fields(row),
+                    detail="Block trade may contaminate official price"
+                ))
+        return issues
+
+
+// 4) 集合竞价逻辑
+class CallAuctionRule implements Rule:
+    name = "CallAuctionRule"
+    category = "Microstructure"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.market_rules.has_call_auction_issue(row.ticker, row.date):
+                issues.append(Issue(
+                    type="CALL_AUCTION_ANOMALY",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="open",
+                    value=row.open,
+                    detail="Call auction price/volume anomaly"
+                ))
+        return issues
+
+
+// 5) 流动性枯竭（价差极宽导致噪音）
+class LiquidityDryUpRule implements Rule:
+    name = "LiquidityDryUpRule"
+    category = "Microstructure"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            spread = compute_spread(row) // 需 L2 或盘口数据
+            if spread is not None and spread > context.market_rules.max_spread_threshold:
+                issues.append(Issue(
+                    type="LIQUIDITY_DRY_UP",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="spread",
+                    value=spread,
+                    detail="Spread too wide, poor tradability"
+                ))
+        return issues
+
+
+
+// =====================================================
+// 第六类：高阶量化偏差 (Advanced Quant Biases)
+// =====================================================
+
+// 1) 时点性偏差（Point-in-Time）
+class PointInTimeRule implements Rule:
+    name = "PointInTimeRule"
+    category = "AdvancedBias"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.point_in_time_meta.is_revised(row.ticker, row.date):
+                issues.append(Issue(
+                    type="POINT_IN_TIME_BIAS",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="revision",
+                    value="revised",
+                    detail="Data revised after the fact"
+                ))
+        return issues
+
+
+// 2) 财报重报
+class RestatementRule implements Rule:
+    name = "RestatementRule"
+    category = "AdvancedBias"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.point_in_time_meta.has_restatement(row.ticker, row.date):
+                issues.append(Issue(
+                    type="FINANCIAL_RESTATEMENT",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="fundamental",
+                    value="restated",
+                    detail="Financial statements restated"
+                ))
+        return issues
+
+
+// 3) 公告日 vs 生效日
+class AnnouncementVsEffectiveRule implements Rule:
+    name = "AnnouncementVsEffectiveRule"
+    category = "AdvancedBias"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.corp_actions.announcement_effective_mismatch(row.ticker, row.date):
+                issues.append(Issue(
+                    type="ANNOUNCE_EFFECTIVE_MISMATCH",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="corp_action",
+                    value="announcement_vs_effective",
+                    detail="Announcement date differs from effective date"
+                ))
+        return issues
+
+
+// 4) 汇率一致性问题
+class FXConsistencyRule implements Rule:
+    name = "FXConsistencyRule"
+    category = "AdvancedBias"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.market_rules.requires_fx and not context.market_rules.fx_rate_available(row.date):
+                issues.append(Issue(
+                    type="FX_MISSING",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="fx",
+                    value="missing",
+                    detail="FX rate missing for cross-market conversion"
+                ))
+        return issues
+
+
+// 5) 回填导致的跳空（Backfilling）
+class BackfillingRule implements Rule:
+    name = "BackfillingRule"
+    category = "AdvancedBias"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.point_in_time_meta.is_backfilled(row.ticker, row.date):
+                issues.append(Issue(
+                    type="BACKFILLING_DETECTED",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="data_vendor",
+                    value="backfilled",
+                    detail="Vendor backfilling detected"
+                ))
+        return issues
+
+
+// 6) Internal ID 变更轨迹
+class InternalIdChangeRule implements Rule:
+    name = "InternalIdChangeRule"
+    category = "AdvancedBias"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.lifecycle_map.internal_id_changed(row.ticker, row.date):
+                issues.append(Issue(
+                    type="INTERNAL_ID_CHANGE",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="internal_id",
+                    value="changed",
+                    detail="Internal ID changed, time series may split"
+                ))
+        return issues

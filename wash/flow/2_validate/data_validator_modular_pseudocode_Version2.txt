@@ -1,0 +1,299 @@
+// ========== 可扩展校验阶段（Validator）伪代码 ==========
+// 目标：按“问题类别”组织规则，支持后续增删规则（L1/L2均可扩展）。
+// 核心思想：规则注册表 + 规则执行器 + Issue 输出。
+// 注意：校验阶段只产生 Issue，不修改数据。
+
+// ---------- 数据结构 ----------
+struct Issue {
+    type            // 问题类型标识（如 "MISSING_DATES"）
+    category        // 所属类别（如 "DataIntegrity"）
+    ticker
+    date
+    field
+    value
+    detail          // 额外描述
+}
+
+struct Context {
+    trading_calendar    // 交易日历
+    corp_actions        // 企业行为表（拆股、分红、配股等）
+    lifecycle_map       // 证券生命周期/代码映射
+    market_rules        // 涨跌停、交易制度、交易阶段规则
+    point_in_time_meta  // 供应商修订/回填元数据
+    tz_rules            // 时区/夏令时规则（可选）
+}
+
+// 规则接口：任何校验规则只需实现 validate()
+interface Rule {
+    name
+    category
+    validate(records, context) -> List<Issue>
+}
+
+// ---------- 校验入口 ----------
+function validate_records(records, context) -> List<Issue>:
+    issues = []
+
+    // 1) 注册规则（可增删）
+    rules = build_rule_registry()
+
+    // 2) 执行所有规则
+    for rule in rules:
+        issues.extend(rule.validate(records, context))
+
+    return issues
+
+
+// ---------- 规则注册表（完整注释） ----------
+function build_rule_registry() -> List<Rule>:
+    // 规则注册表的职责：
+    // 1. 明确“当前程序启用哪些校验规则”
+    // 2. 形成“问题类别 → 规则集合”的映射
+    // 3. 便于后续扩展：新增规则只需要
+    //    - 实现一个 Rule
+    //    - 在此处注册
+    //
+    // 使用建议：
+    // - L1 先启用“第一类+第二类”的规则
+    // - L2 再按需开启“微观结构”等更多规则
+    // - 若有策略差异，可用配置文件决定启用哪些规则
+    return [
+        // ===========================
+        // 第一类：基础完整性与时间轴问题 (Data Integrity)
+        // ===========================
+        MissingDatesRule(),          // 交易日缺行、时间序列中断
+        DuplicateDatesRule(),        // 同一股票同一日期多行
+        NonTradingDayRule(),         // 非交易日出现数据
+        TimezoneDSTRule(),           // 时区/夏令时导致错位（可先留空实现）
+
+        // ===========================
+        // 第二类：K线内部逻辑冲突 (Intra-bar Logic)
+        // ===========================
+        HighLowLogicRule(),          // High/Low 极值逻辑错误
+        NegativePriceRule(),         // 价格为负
+        TickSizeRule(),              // 价格不符合最小变动价位
+        VWAPRangeRule(),             // 均价不在 [Low, High]
+        FloatTailErrorRule()         // 浮点尾数误差（如 9.9999999）
+    ]
+
+
+// =====================================================
+// 第一类：基础完整性与时间轴问题 (Data Integrity)
+// =====================================================
+
+// 1) 交易日缺行 / 时间序列中断
+class MissingDatesRule implements Rule:
+    name = "MissingDatesRule"
+    category = "DataIntegrity"
+
+    function validate(records, context):
+        issues = []
+        grouped = group_by_ticker(records)
+
+        for ticker, rows in grouped:
+            sorted_rows = sort_by_date(rows)
+            prev_date = None
+
+            for row in sorted_rows:
+                if prev_date is not None:
+                    // 查询前后日期之间缺失的交易日
+                    missing_days = context.trading_calendar.missing_days(prev_date, row.date)
+
+                    if missing_days not empty:
+                        issues.append(Issue(
+                            type="MISSING_DATES",
+                            category=category,
+                            ticker=ticker,
+                            date=missing_days,
+                            field="date",
+                            value="gap",
+                            detail="Trading days missing between records"
+                        ))
+                prev_date = row.date
+        return issues
+
+
+// 2) 重复日期记录
+class DuplicateDatesRule implements Rule:
+    name = "DuplicateDatesRule"
+    category = "DataIntegrity"
+
+    function validate(records, context):
+        issues = []
+        grouped = group_by_ticker(records)
+
+        for ticker, rows in grouped:
+            seen = set()
+            for row in rows:
+                key = (ticker, row.date)
+                if key in seen:
+                    issues.append(Issue(
+                        type="DUPLICATE_DATE",
+                        category=category,
+                        ticker=ticker,
+                        date=row.date,
+                        field="date",
+                        value=row.date,
+                        detail="Multiple rows for same ticker & date"
+                    ))
+                else:
+                    seen.add(key)
+        return issues
+
+
+// 3) 非交易日数据
+class NonTradingDayRule implements Rule:
+    name = "NonTradingDayRule"
+    category = "DataIntegrity"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if not context.trading_calendar.is_trading_day(row.date):
+                issues.append(Issue(
+                    type="NON_TRADING_DAY_DATA",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="date",
+                    value=row.date,
+                    detail="Data exists on non-trading day"
+                ))
+        return issues
+
+
+// 4) 时区 / 夏令时错位（可留空实现）
+class TimezoneDSTRule implements Rule:
+    name = "TimezoneDSTRule"
+    category = "DataIntegrity"
+
+    function validate(records, context):
+        issues = []
+        // 预留：跨市场数据时使用
+        // 示例逻辑：
+        // if context.tz_rules.detect_misalignment(record.timestamp):
+        //     issues.append(...)
+        return issues
+
+
+// =====================================================
+// 第二类：K线内部逻辑冲突 (Intra-bar Logic)
+// =====================================================
+
+// 1) High/Low 极值逻辑错误
+class HighLowLogicRule implements Rule:
+    name = "HighLowLogicRule"
+    category = "IntraBarLogic"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if row.high < max(row.open, row.close, row.low):
+                issues.append(Issue(
+                    type="HIGH_BELOW_OTHERS",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="high",
+                    value=row.high,
+                    detail="High is below Open/Close/Low"
+                ))
+            if row.low > min(row.open, row.close, row.high):
+                issues.append(Issue(
+                    type="LOW_ABOVE_OTHERS",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="low",
+                    value=row.low,
+                    detail="Low is above Open/Close/High"
+                ))
+        return issues
+
+
+// 2) 价格为负
+class NegativePriceRule implements Rule:
+    name = "NegativePriceRule"
+    category = "IntraBarLogic"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if row.open < 0 or row.high < 0 or row.low < 0 or row.close < 0 or row.vwap < 0:
+                issues.append(Issue(
+                    type="NEGATIVE_PRICE",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="price",
+                    value=extract_price_fields(row),
+                    detail="Negative price not allowed"
+                ))
+        return issues
+
+
+// 3) Tick size 不合法
+class TickSizeRule implements Rule:
+    name = "TickSizeRule"
+    category = "IntraBarLogic"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if not is_valid_tick(row.open) or not is_valid_tick(row.high) or
+               not is_valid_tick(row.low)  or not is_valid_tick(row.close) or
+               not is_valid_tick(row.vwap):
+                issues.append(Issue(
+                    type="INVALID_TICK_SIZE",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="price",
+                    value=extract_price_fields(row),
+                    detail="Price not aligned to tick size"
+                ))
+        return issues
+
+
+// 4) VWAP 不在 [Low, High]
+class VWAPRangeRule implements Rule:
+    name = "VWAPRangeRule"
+    category = "IntraBarLogic"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if row.vwap < row.low or row.vwap > row.high:
+                issues.append(Issue(
+                    type="VWAP_OUT_OF_RANGE",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="vwap",
+                    value=row.vwap,
+                    detail="VWAP is outside [Low, High]"
+                ))
+        return issues
+
+
+// 5) 浮点尾数误差（如 9.9999999）
+class FloatTailErrorRule implements Rule:
+    name = "FloatTailErrorRule"
+    category = "IntraBarLogic"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if has_float_tail_error(row.open) or has_float_tail_error(row.high) or
+               has_float_tail_error(row.low)  or has_float_tail_error(row.close) or
+               has_float_tail_error(row.vwap):
+                issues.append(Issue(
+                    type="FLOAT_TAIL_ERROR",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="price",
+                    value=extract_price_fields(row),
+                    detail="Floating tail error detected"
+                ))
+        return issues

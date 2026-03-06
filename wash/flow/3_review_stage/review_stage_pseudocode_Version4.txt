@@ -1,0 +1,63 @@
+// ========== 人工核验阶段（Review Stage）伪代码 ==========
+// 目标：在 Validator 输出 issues 之后，让用户“只做禁用处理”，
+//       不允许新增修改意见，从而保持流程简单。
+// 输出：approved_issues（可处理） + disabled_issues（被禁用）
+
+function review_stage(issues, config) -> (approved_issues, disabled_issues, review_report):
+    approved_issues = []
+    disabled_issues = []
+
+    // 1) 生成统计摘要（供用户理解问题全貌）
+    stats = summarize_issues(issues)
+    // stats 包含：
+    // - 按日期分布
+    // - 按类别分布
+    // - 按规则分布
+    // - 问题总量、股票数、异常密度等
+
+    // 2) 生成可视化图表
+    charts = []
+    if config.review.charts.enabled:
+        if "issue_by_date" in config.review.charts.type:
+            charts.append(plot_issue_by_date(issues))
+        if "issue_by_category" in config.review.charts.type:
+            charts.append(plot_issue_by_category(issues))
+        if "issue_by_rule" in config.review.charts.type:
+            charts.append(plot_issue_by_rule(issues))
+
+    // 3) 生成修改预览（不执行修改，只给用户看）
+    preview = []
+    if config.review.preview.enabled:
+        sample_issues = sample(issues, config.review.preview.sample_size)
+        for issue in sample_issues:
+            suggested_fix = simulate_fix(issue)        // 仅模拟预览
+            preview.append({
+                "issue": issue,
+                "suggested_fix": suggested_fix
+            })
+
+    // 4) 输出 review 报告（文本+图表+预览）
+    review_report = {
+        "stats": stats,
+        "charts": charts,
+        "preview": preview
+    }
+    save_review_report(review_report, config.review.output_dir)
+
+    // 5) 读取用户“禁用列表”（用户只能禁用，不可新增）
+    // 用户通过配置文件或 review 禁用清单指定
+    disabled_set = load_disabled_issues(config.review)
+
+    // 6) 根据禁用列表过滤
+    for issue in issues:
+        if is_disabled(issue, disabled_set):
+            disabled_issues.append(issue)
+        else:
+            approved_issues.append(issue)
+
+    return approved_issues, disabled_issues, review_report
+
+
+// ====== 辅助逻辑说明 ======
+// load_disabled_issues: 读取用户在 review 阶段生成的禁用清单
+// is_disabled: 判断 issue 是否落在禁用条件中（按类型/日期/股票/规则）

@@ -1,0 +1,65 @@
+// ========== 用户输入处理模块（稳健 YAML 校验）伪代码 ==========
+// 目标：保证 config.yaml 合法、规则与处理策略存在、字段格式正确。
+// 原则：永远不信任用户输入。
+
+function load_and_validate_config(config_path) -> Config:
+    // 1) 文件存在性检查
+    if not file_exists(config_path):
+        raise ConfigError("Config file not found")
+
+    // 2) YAML 解析（语法层）
+    raw_text = read_text(config_path)
+    try:
+        raw_cfg = parse_yaml(raw_text)
+    except:
+        raise ConfigError("Invalid YAML syntax")
+
+    // 3) 结构校验（schema 校验）
+    // 必填字段 / 类型检查 / enum 校验
+    schema_errors = validate_schema(raw_cfg)
+    if schema_errors not empty:
+        raise ConfigError("Schema validation failed", schema_errors)
+
+    // 4) 合并默认值（calendar / market_rules）
+    cfg = apply_defaults(raw_cfg)
+
+    // 5) 规则存在性校验
+    all_rules = get_all_registered_rules()         // 来自规则注册表
+    all_categories = get_all_categories()
+
+    // 校验 category 名称是否合法
+    for c in cfg.rules.enabled_categories:
+        if c not in all_categories:
+            raise ConfigError("Unknown category: " + c)
+
+    // 校验 rule 名称是否合法
+    for r in cfg.rules.enabled_rules:
+        if r not in all_rules:
+            raise ConfigError("Unknown rule: " + r)
+
+    // 禁用规则校验
+    for r in cfg.rules.disabled_rules:
+        if r not in all_rules:
+            raise ConfigError("Unknown rule: " + r)
+
+    // 6) 策略存在性校验
+    // 每个 policy 绑定的 rule 必须存在
+    for policy in cfg.handling.policies:
+        if policy.rule_name not in all_rules:
+            raise ConfigError("Policy references unknown rule: " + policy.rule_name)
+
+        // 校验处理方式格式是否正确（参数类型/范围）
+        if not validate_policy_schema(policy):
+            raise ConfigError("Policy format invalid: " + policy.name)
+
+    // 7) 规则与策略一致性检查
+    // 对启用规则缺少处理策略给出 warning（不阻断）
+    enabled_rules = resolve_enabled_rules(cfg, all_rules)
+    for rule in enabled_rules:
+        if not cfg.handling.has_policy_for(rule):
+            warn("Rule enabled but no policy configured: " + rule)
+
+    // 8) IO 路径合法性检查
+    validate_paths(cfg)
+
+    return cfg

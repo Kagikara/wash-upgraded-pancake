@@ -1,0 +1,11 @@
+.history/
+  HEAD                         # 当前指向的 commit id
+  commits/
+    <commit_id>/
+      meta.json                # 提交元信息：时间、作者、说明、父 commit
+      config.yaml              # 当时使用的配置
+      cleaned.csv              # 清洗后的数据快照
+      audit_log.json           # 审计日志
+      audit_log.csv            # 审计日志（给 LLM）
+      report.md                # LLM 报告（可选）
+      summary.json             # 统计摘要（issues / 修复数量 / 性能）

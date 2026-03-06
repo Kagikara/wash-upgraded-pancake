@@ -1,0 +1,42 @@
+// ========== LLM 报告模块（可选）伪代码 ==========
+// 目标：基于审计日志与统计摘要生成自然语言清洗报告。
+// 该模块是可选的，是否启用由 config.llm_report.enabled 控制。
+
+function generate_llm_report(audit_entries, performance_summary, config):
+    // 1) 判断是否启用
+    if not config.llm_report.enabled:
+        return None
+
+    // 2) 组织输入摘要（避免 token 过大）
+    summary = {
+        "total_rows": performance_summary.total_rows,
+        "total_issues": performance_summary.total_issues,
+        "processed_issues": performance_summary.processed_issues,
+        "unresolved_issues": performance_summary.unresolved_issues,
+        "disabled_issues": performance_summary.disabled_issues,
+        "top_issue_types": top_k_issue_types(audit_entries, k=10),
+        "top_rules": top_k_rules(audit_entries, k=10),
+        "time_cost_ms": performance_summary.total_time_ms,
+        "throughput": performance_summary.throughput_rows_per_sec
+    }
+
+    // 3) 读取 CSV（更省 token，用于模型分析）
+    audit_csv_sample = sample_csv(config.output.audit_log_csv, max_rows=500)
+
+    // 4) 构建提示词（Prompt）
+    prompt = build_prompt(
+        summary = summary,
+        audit_sample = audit_csv_sample
+    )
+
+    // 5) 调用 LLM（抽象接口）
+    report_text = llm_call(
+        model = config.llm_report.model,      // 如 "gpt-4o-mini"
+        prompt = prompt,
+        max_tokens = config.llm_report.max_tokens
+    )
+
+    // 6) 保存报告
+    write_text(report_text, config.llm_report.output_path)
+
+    return report_text

@@ -1,0 +1,68 @@
+version: "0.1"
+mode: "review-only"          # review-only | clean | full
+
+input:
+  path: "data/raw.csv"
+  format: "csv"               # csv | parquet
+  schema:
+    date: "date"
+    ticker: "ticker"
+    open: "open"
+    high: "high"
+    low: "low"
+    close: "close"
+    vwap: "vwap"
+    volume: "volume"
+    turnover: "turnover"
+    status: "status"
+
+# 提供默认值（若缺失则使用默认路径）
+calendar:
+  trading_calendar_path: "data/default_trading_calendar.csv"
+
+# 提供默认值（若缺失则使用默认规则）
+market_rules:
+  path: "data/default_market_rules.yaml"
+
+# 可选项：允许为空或不提供
+corporate_actions:
+  path: ""                    # 留空代表不启用
+
+# 可选项：允许为空或不提供
+lifecycle_map:
+  path: ""                    # 留空代表不启用
+
+rules:
+  enabled_categories:
+    - "DataIntegrity"
+    - "IntraBarLogic"
+  enabled_rules: []            # 可留空，表示按类别启用
+  disabled_rules: []           # 强制禁用
+
+handling:
+  policies: {}                 # 后续补充
+
+review:
+  output_dir: "output/review"
+  charts:
+    enabled: true
+    type:
+      - "issue_by_date"
+      - "issue_by_category"
+      - "issue_by_rule"
+  preview:
+    enabled: true
+    sample_size: 200
+
+output:
+  cleaned_path: "output/cleaned.csv"
+  audit_log_json: "output/audit_log.json"
+  audit_log_csv: "output/audit_log.csv"
+
+llm_report:
+  enabled: true
+  output_path: "output/report.md"
+
+versioning:
+  enabled: true
+  history_dir: "output/history"

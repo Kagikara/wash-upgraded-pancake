@@ -1,0 +1,99 @@
+// ========== Audit Log 伪代码 ==========
+// 目标：记录清洗全过程的“问题 → 动作 → 结果”以及性能指标。
+// 输出：audit_entries (结构化记录) + performance_summary
+
+// ---------- Audit Entry 结构 ----------
+struct AuditEntry {
+    timestamp           // 记录时间
+    stage               // LOAD / VALIDATE / CLEAN
+    ticker
+    date
+    issue_type          // 问题类型
+    category            // 问题类别
+    rule_name           // 触发规则
+    field               // 被修改字段
+    old_value
+    new_value
+    action              // 执行动作（如 FFILL / DROP / UNRESOLVED）
+    action_source       // AUTO / MANUAL / DISABLED
+    comment             // 额外说明
+}
+
+// ---------- 性能指标结构 ----------
+struct PerformanceSummary {
+    total_rows
+    load_error_count
+    total_issues
+    processed_issues
+    unresolved_issues
+    disabled_issues
+    total_time_ms
+    throughput_rows_per_sec
+    rule_time_breakdown   // 每条规则耗时统计
+}
+
+// ---------- 记录 audit entry ----------
+function new_audit_entry(issue, action, old_value, new_value, action_source="AUTO", comment="") -> AuditEntry:
+    return AuditEntry(
+        timestamp = now(),
+        stage = "CLEAN",
+        ticker = issue.ticker,
+        date = issue.date,
+        issue_type = issue.type,
+        category = issue.category,
+        rule_name = issue.rule_name,
+        field = issue.field,
+        old_value = old_value,
+        new_value = new_value,
+        action = action,
+        action_source = action_source,
+        comment = comment
+    )
+
+
+// ---------- 将 Loader 错误并入 audit entry ----------
+function new_load_error_audit_entry(load_error) -> AuditEntry:
+    return AuditEntry(
+        timestamp = now(),
+        stage = "LOAD",
+        ticker = "",
+        date = "",
+        issue_type = "LOAD_PARSE_ERROR",
+        category = "Loader",
+        rule_name = "LoaderSchemaParse",
+        field = "raw_row",
+        old_value = load_error.raw_row,
+        new_value = load_error.raw_row,
+        action = "UNRESOLVED",
+        action_source = "AUTO",
+        comment = "row=" + to_string(load_error.row_number) + ", code=" + load_error.error_code
+    )
+
+
+// ---------- 性能统计 ----------
+function build_performance_summary(records, load_errors, issues, audit_entries, disabled_issues, start_time, end_time, rule_timers):
+    total_time_ms = end_time - start_time
+
+    return PerformanceSummary(
+        total_rows = len(records),
+        load_error_count = len(load_errors),
+        total_issues = len(issues),
+        processed_issues = count(audit_entries where action != "UNRESOLVED"),
+        unresolved_issues = count(audit_entries where action == "UNRESOLVED"),
+        disabled_issues = len(disabled_issues),
+        total_time_ms = total_time_ms,
+        throughput_rows_per_sec = len(records) / (total_time_ms / 1000.0),
+        rule_time_breakdown = rule_timers
+    )
+
+
+// ---------- 写出审计日志 ----------
+function write_audit_log(audit_entries, performance_summary, output_json, output_csv):
+    // JSON：完整结构，包含性能数据
+    write_json({
+        "audit_entries": audit_entries,
+        "performance": performance_summary
+    }, output_json)
+
+    // CSV：只写 audit_entries，供 LLM 快速读取
+    write_csv(audit_entries, output_csv)

@@ -1,0 +1,49 @@
+// ========== 失败恢复（Fail-safe & Recovery）伪代码 ==========
+// 目标：任一阶段失败时，保留中间产物，允许恢复。
+
+function run_pipeline_with_recovery(config):
+    context = build_context(config)
+
+    try:
+        // Stage 1: Load
+        records, load_errors = loader.read(config.input)
+        save_checkpoint("load", {records, load_errors}, config)
+
+        // Stage 2: Validate
+        issues = validator.run(records, context)
+        save_checkpoint("validate", issues, config)
+
+        // Stage 3: Review
+        approved, disabled, report = review_stage(issues, config)
+        save_checkpoint("review", {approved, disabled, report}, config)
+
+        if config.mode == "review-only":
+            return
+
+        // Stage 4: Clean
+        cleaned, audit_entries = cleaner.clean(records, approved, load_errors, config)
+        save_checkpoint("clean", {cleaned, audit_entries}, config)
+
+        // Stage 5: Write
+        writer.write(cleaned, audit_entries, config)
+        save_checkpoint("write", "done", config)
+
+        // Stage 6: LLM Report (optional)
+        if config.llm_report.enabled:
+            llm_report.generate(audit_entries, config)
+
+        // Stage 7: Versioning
+        versioning.commit(config, cleaned, audit_entries)
+
+    except Exception as e:
+        log_error(e)
+        save_checkpoint("error", e, config)
+        raise PipelineError("Pipeline failed, checkpoint saved")
+
+
+// ---------- Checkpoint 机制 ----------
+function save_checkpoint(stage, payload, config):
+    // 每个 stage 输出中间结果到 .checkpoint/ 目录
+    // 用于失败时恢复
+    path = ".checkpoint/" + stage
+    write_pickle_or_json(payload, path)

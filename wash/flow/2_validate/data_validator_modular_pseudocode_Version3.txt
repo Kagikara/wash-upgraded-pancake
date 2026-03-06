@@ -1,0 +1,333 @@
+// =====================================================
+// 第三类：权益变动与复权逻辑 (Corporate Actions)
+// =====================================================
+
+// 1) 拆股/送转导致跳空
+class SplitDividendGapRule implements Rule:
+    name = "SplitDividendGapRule"
+    category = "CorporateActions"
+
+    function validate(records, context):
+        issues = []
+        grouped = group_by_ticker(records)
+        for ticker, rows in grouped:
+            sorted_rows = sort_by_date(rows)
+            for i from 1 to len(sorted_rows)-1:
+                prev = sorted_rows[i-1]
+                cur  = sorted_rows[i]
+                if is_large_gap(prev.close, cur.open):
+                    if context.corp_actions.has_split_or_bonus(ticker, cur.date):
+                        issues.append(Issue(
+                            type="SPLIT_BONUS_GAP",
+                            category=category,
+                            ticker=ticker,
+                            date=cur.date,
+                            field="open",
+                            value=cur.open,
+                            detail="Gap explained by split/bonus action"
+                        ))
+                    else:
+                        issues.append(Issue(
+                            type="UNEXPLAINED_GAP",
+                            category=category,
+                            ticker=ticker,
+                            date=cur.date,
+                            field="open",
+                            value=cur.open,
+                            detail="Large gap without split/bonus action"
+                        ))
+        return issues
+
+
+// 2) 现金分红跳空（税前/税后复权）
+class CashDividendRule implements Rule:
+    name = "CashDividendRule"
+    category = "CorporateActions"
+
+    function validate(records, context):
+        issues = []
+        grouped = group_by_ticker(records)
+        for ticker, rows in grouped:
+            sorted_rows = sort_by_date(rows)
+            for i from 1 to len(sorted_rows)-1:
+                prev = sorted_rows[i-1]
+                cur  = sorted_rows[i]
+                if is_large_gap(prev.close, cur.open):
+                    if context.corp_actions.has_cash_dividend(ticker, cur.date):
+                        issues.append(Issue(
+                            type="CASH_DIVIDEND_GAP",
+                            category=category,
+                            ticker=ticker,
+                            date=cur.date,
+                            field="open",
+                            value=cur.open,
+                            detail="Gap aligned with cash dividend event"
+                        ))
+        return issues
+
+
+// 3) 配股/增发导致的价格调整
+class RightsIssueRule implements Rule:
+    name = "RightsIssueRule"
+    category = "CorporateActions"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.corp_actions.has_rights_issue(row.ticker, row.date):
+                issues.append(Issue(
+                    type="RIGHTS_ISSUE",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="corp_action",
+                    value="rights_issue",
+                    detail="Rights issue event detected"
+                ))
+        return issues
+
+
+// 4) 资产剥离 / 分拆上市
+class SpinOffRule implements Rule:
+    name = "SpinOffRule"
+    category = "CorporateActions"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.corp_actions.has_spin_off(row.ticker, row.date):
+                issues.append(Issue(
+                    type="SPIN_OFF",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="corp_action",
+                    value="spin_off",
+                    detail="Spin-off event detected"
+                ))
+        return issues
+
+
+// 5) 可转债转股导致稀释
+class ConvertibleDilutionRule implements Rule:
+    name = "ConvertibleDilutionRule"
+    category = "CorporateActions"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.corp_actions.has_convertible_conversion(row.ticker, row.date):
+                issues.append(Issue(
+                    type="CONVERTIBLE_DILUTION",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="corp_action",
+                    value="convertible_conversion",
+                    detail="Convertible bond conversion detected"
+                ))
+        return issues
+
+
+// 6) 股权激励与期权行权
+class EquityIncentiveRule implements Rule:
+    name = "EquityIncentiveRule"
+    category = "CorporateActions"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.corp_actions.has_equity_incentive(row.ticker, row.date):
+                issues.append(Issue(
+                    type="EQUITY_INCENTIVE",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="corp_action",
+                    value="equity_incentive",
+                    detail="Equity incentive / option exercise detected"
+                ))
+        return issues
+
+
+// 7) 定增解禁（流通股本突变）
+class UnlockingRule implements Rule:
+    name = "UnlockingRule"
+    category = "CorporateActions"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.corp_actions.has_unlocking(row.ticker, row.date):
+                issues.append(Issue(
+                    type="LOCKUP_EXPIRY",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="corp_action",
+                    value="lockup_expiry",
+                    detail="Restricted shares unlocking detected"
+                ))
+        return issues
+
+
+
+// =====================================================
+// 第四类：证券生命周期与映射 (Lifecycle & Mapping)
+// =====================================================
+
+// 1) 退市处理
+class DelistingRule implements Rule:
+    name = "DelistingRule"
+    category = "LifecycleMapping"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.lifecycle_map.is_delisted(row.ticker, row.date):
+                issues.append(Issue(
+                    type="DELISTED_SECURITY",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="status",
+                    value="delisted",
+                    detail="Security is delisted on this date"
+                ))
+        return issues
+
+
+// 2) 代码重用 / 更名
+class TickerReuseRule implements Rule:
+    name = "TickerReuseRule"
+    category = "LifecycleMapping"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.lifecycle_map.is_ticker_reused(row.ticker, row.date):
+                issues.append(Issue(
+                    type="TICKER_REUSE",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="ticker",
+                    value=row.ticker,
+                    detail="Ticker reused for a different entity"
+                ))
+            if context.lifecycle_map.is_renamed(row.ticker, row.date):
+                issues.append(Issue(
+                    type="TICKER_RENAME",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="ticker",
+                    value=row.ticker,
+                    detail="Ticker renamed / company name changed"
+                ))
+        return issues
+
+
+// 3) 合并与收购 (M&A)
+class MergerAcquisitionRule implements Rule:
+    name = "MergerAcquisitionRule"
+    category = "LifecycleMapping"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.lifecycle_map.has_merger_or_acquisition(row.ticker, row.date):
+                issues.append(Issue(
+                    type="MERGER_ACQUISITION",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="lifecycle",
+                    value="m&a",
+                    detail="M&A event affects continuity"
+                ))
+        return issues
+
+
+// 4) 指数成分股变动（避免后视偏差）
+class IndexMembershipRule implements Rule:
+    name = "IndexMembershipRule"
+    category = "LifecycleMapping"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.lifecycle_map.index_membership_changed(row.ticker, row.date):
+                issues.append(Issue(
+                    type="INDEX_MEMBERSHIP_CHANGE",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="index",
+                    value="membership_changed",
+                    detail="Index membership change detected"
+                ))
+        return issues
+
+
+// 5) *ST / ST 状态变化（涨跌停规则变化）
+class SpecialTreatmentRule implements Rule:
+    name = "SpecialTreatmentRule"
+    category = "LifecycleMapping"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.lifecycle_map.is_special_treatment(row.ticker, row.date):
+                issues.append(Issue(
+                    type="SPECIAL_TREATMENT",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="status",
+                    value="ST",
+                    detail="ST/*ST status affects price limits"
+                ))
+        return issues
+
+
+// 6) 交易所熔断 / 全市场停牌
+class CircuitBreakerRule implements Rule:
+    name = "CircuitBreakerRule"
+    category = "LifecycleMapping"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.lifecycle_map.is_circuit_breaker_day(row.date):
+                issues.append(Issue(
+                    type="CIRCUIT_BREAKER",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="market",
+                    value="circuit_breaker",
+                    detail="Market-wide circuit breaker day"
+                ))
+        return issues
+
+
+// 7) 监管停牌 / 特停
+class RegulatorySuspensionRule implements Rule:
+    name = "RegulatorySuspensionRule"
+    category = "LifecycleMapping"
+
+    function validate(records, context):
+        issues = []
+        for row in records:
+            if context.lifecycle_map.is_regulatory_suspension(row.ticker, row.date):
+                issues.append(Issue(
+                    type="REGULATORY_SUSPENSION",
+                    category=category,
+                    ticker=row.ticker,
+                    date=row.date,
+                    field="status",
+                    value="suspended",
+                    detail="Regulatory suspension detected"
+                ))
+        return issues

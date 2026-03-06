@@ -1,0 +1,157 @@
+// ========== 数据校验阶段（Validator）伪代码 ==========
+// 目标：只“检查问题”，不修改数据。
+// 输出：issues 列表，每条包含问题类型、字段、原始值、定位信息。
+
+function validate_records(records, trading_calendar, corp_actions) -> List<Issue>:
+    issues = []
+
+    // 1. 建立快速索引：按股票代码分组，便于时间序列检查
+    grouped = group_by_ticker(records)
+
+    // 2. 逐股票校验
+    for ticker, rows in grouped:
+        // 2.1 按日期排序（仅用于校验，不修改原数据）
+        sorted_rows = sort_by_date(rows)
+
+        // 2.2 日期重复、时间序列缺失、个股数据缺失检查
+        prev_date = None
+        for row in sorted_rows:
+            // 交易日历校验（非交易日出现数据）
+            if not trading_calendar.is_trading_day(row.date):
+                issues.append(new_issue(
+                    type="NON_TRADING_DAY_DATA",
+                    ticker=ticker,
+                    date=row.date,
+                    field="date",
+                    value=row.date
+                ))
+
+            // 重复日期检查
+            if prev_date == row.date:
+                issues.append(new_issue(
+                    type="DUPLICATE_DATE",
+                    ticker=ticker,
+                    date=row.date,
+                    field="date",
+                    value=row.date
+                ))
+
+            // 时间序列缺失检查（仅标记缺口）
+            if prev_date is not None:
+                missing_days = trading_calendar.missing_days(prev_date, row.date)
+                if missing_days is not empty:
+                    issues.append(new_issue(
+                        type="MISSING_DATES",
+                        ticker=ticker,
+                        date=missing_days,
+                        field="date",
+                        value="gap"
+                    ))
+
+                    // ===== 个股数据缺失（短期/长期）=====
+                    // 只要有交易日缺口，就视为“个股缺失”
+                    // 这里仅记录，具体“短期/长期”划分由后续修复策略处理
+                    issues.append(new_issue(
+                        type="MISSING_STOCK_DATA",
+                        ticker=ticker,
+                        date=missing_days,
+                        field="date",
+                        value="missing_stock_days"
+                    ))
+
+            prev_date = row.date
+
+        // 2.3 行级逻辑校验（逐条记录）
+        for row in rows:
+            // 价格非负
+            if row.open < 0 or row.high < 0 or row.low < 0 or row.close < 0 or row.vwap < 0:
+                issues.append(new_issue(
+                    type="NEGATIVE_PRICE",
+                    ticker=ticker,
+                    date=row.date,
+                    field="price",
+                    value=extract_price_fields(row)
+                ))
+
+            // High/Low 与其他价格一致性
+            if row.high < max(row.open, row.close, row.low):
+                issues.append(new_issue(
+                    type="HIGH_BELOW_OTHERS",
+                    ticker=ticker,
+                    date=row.date,
+                    field="high",
+                    value=row.high
+                ))
+
+            if row.low > min(row.open, row.close, row.high):
+                issues.append(new_issue(
+                    type="LOW_ABOVE_OTHERS",
+                    ticker=ticker,
+                    date=row.date,
+                    field="low",
+                    value=row.low
+                ))
+
+            // 均价是否在区间
+            if row.vwap < row.low or row.vwap > row.high:
+                issues.append(new_issue(
+                    type="VWAP_OUT_OF_RANGE",
+                    ticker=ticker,
+                    date=row.date,
+                    field="vwap",
+                    value=row.vwap
+                ))
+
+            // Tick size 合法性（例：0.01 元）
+            if not is_valid_tick(row.open) or not is_valid_tick(row.high)
+               or not is_valid_tick(row.low)  or not is_valid_tick(row.close):
+                issues.append(new_issue(
+                    type="INVALID_TICK_SIZE",
+                    ticker=ticker,
+                    date=row.date,
+                    field="price",
+                    value=extract_price_fields(row)
+                ))
+
+            // 成交量=0但价格变动
+            if row.volume == 0 and price_moved(row, prev_close_of(ticker, row.date)):
+                issues.append(new_issue(
+                    type="VOLUME_ZERO_PRICE_MOVED",
+                    ticker=ticker,
+                    date=row.date,
+                    field="volume",
+                    value=row.volume
+                ))
+
+            // 涨跌幅超限制（仅标记，不处理）
+            if exceeds_price_limit(row, prev_close_of(ticker, row.date)):
+                issues.append(new_issue(
+                    type="PRICE_LIMIT_EXCEEDED",
+                    ticker=ticker,
+                    date=row.date,
+                    field="close",
+                    value=row.close
+                ))
+
+            // ===== 拆股/分红跳空检测 =====
+            // 逻辑：若出现大幅跳空，同时当天有企业行为记录 => 标记为企业行为跳空
+            // 若无企业行为记录但跳空显著 => 标记为异常跳空
+            if is_large_gap(row, prev_close_of(ticker, row.date)):
+                if corp_actions.has_action(ticker, row.date):
+                    issues.append(new_issue(
+                        type="CORP_ACTION_GAP",
+                        ticker=ticker,
+                        date=row.date,
+                        field="close",
+                        value=row.close
+                    ))
+                else:
+                    issues.append(new_issue(
+                        type="UNEXPLAINED_GAP",
+                        ticker=ticker,
+                        date=row.date,
+                        field="close",
+                        value=row.close
+                    ))
+
+    return issues

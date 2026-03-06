@@ -1,0 +1,85 @@
+// ========== 数据读取阶段（Loader）伪代码 ==========
+// 目标：从离线文件中读取并解析原始行情数据，形成标准化 Record 列表。
+// 注意：本阶段不做业务校验，只保证“能读出来”。
+
+struct LoadError {
+    stage           // 固定为 "LOAD"
+    row_number
+    raw_row
+    error_code      // 如 PARSE_FAIL / TYPE_CAST_FAIL
+    error_detail
+}
+
+function load_data(input_path, format, schema) -> (List<Record>, List<LoadError>):
+    records = []                      // 存放解析成功的记录
+    load_errors = []                  // 记录解析失败的行（供后续 Audit Log 使用）
+
+    // 1. 打开数据源
+    stream = open_stream(input_path)
+
+    // 2. 根据格式创建读取器
+    if format == "csv":
+        reader = CsvReader(stream, has_header=true, delimiter=",")
+    else if format == "parquet":
+        reader = ParquetReader(stream)
+    else:
+        raise UnsupportedFormatError
+
+    // 3. 遍历每一行数据
+    row_number = 0
+    for row in reader:
+        row_number += 1
+        // 3.1 解析当前行，按 schema 将字段映射到 Record
+        record = parse_row(row, schema)
+
+        if record is not None:
+            records.append(record)     // 解析成功，加入记录集
+        else:
+            // 解析失败，不丢弃信息，记录下来
+            load_errors.append(LoadError(
+                stage = "LOAD",
+                row_number = row_number,
+                raw_row = row,
+                error_code = "PARSE_FAIL",
+                error_detail = "Failed to parse row by schema"
+            ))
+
+    // 4. 关闭文件流
+    close_stream(stream)
+
+    // 5. 将成功记录和解析失败信息返回（失败信息会并入 audit_entries / summary）
+    return records, load_errors
+
+
+// ========== 行解析函数 ==========
+// 目标：将一行原始数据解析为标准 Record，保证字段类型正确。
+// 解析失败则返回 None。
+function parse_row(row, schema) -> Record or None:
+    try:
+        record = Record()
+
+        // 日期字段：必须符合 YYYY-MM-DD
+        record.date = parse_date(row[schema.date])
+
+        // 股票代码：直接读取字符串
+        record.ticker = row[schema.ticker]
+
+        // 价格字段：使用 Decimal 防止精度误差
+        record.open  = parse_decimal(row[schema.open])
+        record.high  = parse_decimal(row[schema.high])
+        record.low   = parse_decimal(row[schema.low])
+        record.close = parse_decimal(row[schema.close])
+        record.vwap  = parse_decimal(row[schema.vwap])
+
+        // 成交量与成交额：整数处理（手、万元）
+        record.volume   = parse_int(row[schema.volume])
+        record.turnover = parse_int(row[schema.turnover])
+
+        // 交易状态：映射到枚举
+        record.status = parse_status(row[schema.status])
+
+        return record
+
+    except:
+        // 任一字段解析失败都返回 None
+        return None

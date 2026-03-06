@@ -1,0 +1,70 @@
+// ========== 清洗处理阶段（Cleaner / Policy Engine）伪代码 ==========
+// 目标：依据 YAML 配置或默认策略执行修复，不覆盖源文件。
+// 输入：records（原始数据），approved_issues（审核通过的问题列表），load_errors（加载错误），config
+// 输出：cleaned_records + audit_entries
+
+function clean_records(records, approved_issues, load_errors, config) -> (cleaned_records, audit_entries):
+    cleaned_records = clone(records)        // 必须复制，避免覆盖源数据
+    audit_entries = []
+
+    // 0) 先把 Loader 的解析失败并入审计链路
+    // 这样即使记录未进入 records，也能在审计与汇总中被追踪。
+    for load_error in load_errors:
+        audit_entries.append(new_load_error_audit_entry(load_error))
+
+    // 1) 构建问题索引，便于快速定位
+    issue_index = index_issues(approved_issues)  // key: (ticker, date, type)
+
+    // 2) 遍历每条记录，按问题类型执行修复
+    for record in cleaned_records:
+        key = (record.ticker, record.date)
+
+        // 找出此记录关联的全部问题
+        issues = issue_index.get(key)
+
+        if issues is empty:
+            continue
+
+        for issue in issues:
+            // 2.1 根据 YAML 或默认策略选择处理方式
+            policy = resolve_policy(issue, config.handling.policies)
+
+            // 2.2 若该问题没有配置策略，则跳过并记录为未处理
+            if policy is None:
+                audit_entries.append(new_audit_entry(
+                    issue=issue,
+                    action="UNRESOLVED",
+                    old_value=get_value(record, issue.field),
+                    new_value=get_value(record, issue.field)
+                ))
+                continue
+
+            // 2.3 执行修复（不修改原始数据，只修改副本）
+            old_value = get_value(record, issue.field)
+            new_value = apply_policy(record, issue, policy)
+            set_value(record, issue.field, new_value)
+
+            // 2.4 写入 Audit 记录
+            audit_entries.append(new_audit_entry(
+                issue=issue,
+                action=policy.name,
+                old_value=old_value,
+                new_value=new_value
+            ))
+
+    return cleaned_records, audit_entries
+
+
+
+// ========== 输出层（Writer）伪代码 ==========
+// 目标：输出清洗后的数据文件，不覆盖原始文件；同时输出审计日志（JSON + CSV）
+
+function write_outputs(cleaned_records, audit_entries, config):
+    // 1) 写出清洗后数据（新路径）
+    write_table(cleaned_records, config.output.cleaned_path)
+
+    // 2) 写出审计日志（JSON）
+    write_json(audit_entries, config.output.audit_log_json)
+
+    // 3) 写出审计日志（CSV，便于 LLM 分析）
+    write_csv(audit_entries, config.output.audit_log_csv)
