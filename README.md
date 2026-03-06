@@ -1,25 +1,25 @@
 # wash-upgraded-pancake
-*！给量化人提供最真实的可用于策略的数据！*
+*给量化用户提供最真实的可用于策略的数据！*
 
-L1和L2股票数据清洗程序，提供用户客制化清洗需求选择。
+基于Rust的L1和L2股票数据清洗程序，提供用户客制化清洗需求选择。
 
 支持配置.YAML文件记录问题处理模块扩展，提高可处理问题的广泛性。用户通过自由配置“需要解决什么问题”和“怎么解决问题”，搭配出策略最适的数据清洗方式。
 
-# L1数据清洗程序全流程说明（LCI 配置驱动）
+# L1数据清洗程序全流程说明（CLI 配置驱动）
 
 > 目标：以 **YAML 配置驱动 + 模块化流水线** 的方式完成数据审查、人工核验、清洗、输出、审计与版本控制。  
 > 原则：**审查与清洗解耦、可扩展、可回滚、可审计**。
 
 ---
 
-## 0. CLI 调用方式（LCI）
+## 0. CLI 调用方式（CLI）
 ```bash
 cleaner --config config.yaml --review-only
 ```
 
 ---
 
-## 1. 配置加载（LCI Config）
+## 1. 配置加载（CLI Config）
 **输入：** `config.yaml`  
 **输出：** `Config` 对象（合并默认值）
 
@@ -37,6 +37,7 @@ cleaner --config config.yaml --review-only
 - 支持 CSV / Parquet
 - 使用 schema 映射字段
 - 解析错误写入 `load_errors`（供审计）
+- `load_errors` 会在清洗阶段并入 `audit_entries`，并计入 `performance_summary.load_error_count`
 
 ---
 
@@ -63,12 +64,13 @@ cleaner --config config.yaml --review-only
 ---
 
 ## 5. 清洗处理（Cleaner / Policy Engine）
-**输入：** `records`, `approved_issues`, `config.handling`  
+**输入：** `records`, `approved_issues`, `load_errors`, `config.handling`  
 **输出：** `cleaned_records`, `audit_entries`
 
 - 根据 YAML 或默认策略修复
 - 不覆盖原始记录，生成新副本
 - 每次修改写入审计条目（AuditEntry）
+- Loader 解析失败也会转为审计条目并进入同一 `audit_entries` 输出
 
 ---
 
@@ -89,6 +91,7 @@ cleaner --config config.yaml --review-only
 - 修改前后值
 - 动作来源（AUTO / MANUAL / DISABLED）
 - 运行性能指标（耗时 / 吞吐量 / 规则耗时分布）
+- Loader 解析失败统计（`load_error_count`）
 
 ---
 
@@ -119,13 +122,13 @@ cleaner --config config.yaml --review-only
 # 全流程数据流图
 
 ```
-LCI Config
+CLI Config
    ↓
 Loader
    ↓
 Validator
    ↓
-Review Stage（人工核验）
+Review Stage
    ↓
 Cleaner
    ↓
