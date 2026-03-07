@@ -1,3 +1,14 @@
+//! Core library for the `wash` data-cleaning pipeline.
+//!
+//! The file intentionally keeps all major pipeline stages together so tests can
+//! exercise cross-stage behavior in one place:
+//! 1) config + load
+//! 2) validate
+//! 3) review stage
+//! 4) cleaner + audit
+//! 5) optional LLM report
+//! 6) versioning + checkpoint recovery
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -173,6 +184,13 @@ pub trait ReviewStage: Send + Sync {
     fn run(&self, issues: &[Issue], config: &ReviewConfig) -> Result<ReviewOutput, ReviewError>;
 }
 
+/// Default review-stage orchestrator.
+///
+/// Responsibilities:
+/// - aggregate issue statistics
+/// - optionally render review charts and preview fixes
+/// - persist review report
+/// - split issues into approved vs disabled based on user rules
 pub struct DefaultReviewStage<P, C, V, S>
 where
     P: DisabledIssueProvider,
@@ -256,6 +274,8 @@ where
     S: ReviewReportStore,
 {
     fn run(&self, issues: &[Issue], config: &ReviewConfig) -> Result<ReviewOutput, ReviewError> {
+        // Build report artifacts first so review outputs remain reproducible
+        // even when all issues are eventually disabled.
         let stats = Self::summarize_issues(issues);
 
         let mut charts = Vec::new();
@@ -275,6 +295,7 @@ where
 
         self.report_store.save(&review_report, config)?;
 
+        // Review stage is intentionally non-mutating: it only filters issues.
         let disabled_rules = self.disabled_provider.load_disabled_rules(config)?;
         let mut approved_issues = Vec::new();
         let mut disabled_issues = Vec::new();
@@ -1082,6 +1103,8 @@ where
             return Ok(None);
         }
 
+        // Run the full generation pipeline in a closure so we can support
+        // `fail_open` behavior without duplicating logic.
         let run = || -> Result<LlmReportOutput, LlmReportError> {
             let summary = self
                 .summary_builder
@@ -1168,6 +1191,10 @@ pub trait CleanerStage: Send + Sync {
     ) -> Result<CleanerOutput, CleanerError>;
 }
 
+/// Cleaner stage applies policies on approved issues and emits audit entries.
+///
+/// Note that load errors are converted into audit entries and merged into the
+/// same output stream for downstream reporting consistency.
 pub struct DefaultCleanerStage<R, E, M>
 where
     R: PolicyResolver,
@@ -1194,6 +1221,7 @@ where
     }
 
     fn issue_index(issues: &[Issue]) -> HashMap<(String, String), Vec<Issue>> {
+        // Group by (ticker, date) to avoid O(records * issues) scans.
         let mut out: HashMap<(String, String), Vec<Issue>> = HashMap::new();
         for issue in issues {
             out.entry((issue.ticker.clone(), issue.date.clone()))
@@ -1234,6 +1262,8 @@ where
                 let old_value = record_field_value(record, &issue.field)?;
 
                 let Some(policy) = self.resolver.resolve_policy(issue, handling) else {
+                    // Missing policy is tracked as unresolved instead of failing
+                    // hard, so the pipeline can still produce auditable output.
                     unresolved_issues += 1;
                     audit_entries.push(new_audit_entry(
                         issue,
@@ -1994,12 +2024,14 @@ pub fn validate_records(
     plan: &ValidationPlan,
     registry: &ValidationRegistry,
 ) -> Result<ValidationOutput, ValidationError> {
+    // Resolve actual executable rule set from user switches.
     let selected_rules = registry.select_rules(plan)?;
 
     let mut issues = Vec::new();
     let mut metrics = Vec::new();
 
     for rule in selected_rules {
+        // Measure each rule to feed performance / hot-spot diagnostics.
         let start = Instant::now();
         let mut rule_issues = rule.validate(records, ctx)?;
         let elapsed = start.elapsed();
@@ -2464,6 +2496,8 @@ pub fn load_and_validate_config(path: &Path, registry: &dyn RuleRegistry) -> Res
         status: raw.input.schema.status,
     };
 
+    // Default-path filling keeps config concise while preserving deterministic
+    // runtime behavior.
     let calendar_path = raw
         .calendar
         .and_then(|n| n.trading_calendar_path)
@@ -2570,6 +2604,7 @@ fn load_csv_data(cfg: &LoadConfig) -> Result<LoadOutput, LoadStageError> {
         .map_err(|e| LoadStageError::CsvRead(e.to_string()))?
         .clone();
 
+    // Build header lookup once and pass to row parser.
     let mut header_index = HashMap::new();
     for (idx, col) in headers.iter().enumerate() {
         header_index.insert(col.to_string(), idx);
@@ -2607,6 +2642,7 @@ fn parse_csv_row(
     schema: &InputSchemaMap,
     row_number: usize,
 ) -> Result<Record, LoadError> {
+    // Keep original row for diagnostics so bad rows remain inspectable later.
     let raw_row = row.iter().collect::<Vec<_>>().join(",");
 
     let get = |column: &str| -> Result<&str, LoadError> {
@@ -2715,6 +2751,7 @@ impl PipelineStage {
     }
 
     fn next_stage(self) -> Option<Self> {
+        // Linear happy-path order for resume planning.
         match self {
             PipelineStage::Load => Some(PipelineStage::Validate),
             PipelineStage::Validate => Some(PipelineStage::Review),
@@ -2868,6 +2905,7 @@ impl CommitIdStrategy for EpochCommitIdStrategy {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
+        // Commit id mixes timestamp + deterministic suffix from run metadata.
         let ts = now_epoch_millis();
         let mut hasher = DefaultHasher::new();
         input.author.hash(&mut hasher);
@@ -3248,6 +3286,7 @@ impl CheckpointStore for FileCheckpointStore {
     }
 
     fn latest(&self, cfg: &VersioningConfig, run_id: &str) -> Result<Option<CheckpointRecord>, RecoveryError> {
+        // Search from latest stage backwards to find most advanced checkpoint.
         for stage in Self::ordered_stages() {
             let meta_path = Self::meta_path(cfg, run_id, stage);
             if meta_path.exists() {
@@ -3295,6 +3334,7 @@ where
             return Ok(None);
         };
 
+        // Resume from the next stage after latest successful checkpoint.
         let Some(resume_from) = latest.stage.next_stage() else {
             return Ok(None);
         };
