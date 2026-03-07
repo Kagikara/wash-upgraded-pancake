@@ -9,6 +9,339 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReviewChartType {
+    IssueByDate,
+    IssueByCategory,
+    IssueByRule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewChartConfig {
+    pub enabled: bool,
+    pub types: HashSet<ReviewChartType>,
+}
+
+impl Default for ReviewChartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            types: HashSet::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPreviewConfig {
+    pub enabled: bool,
+    pub sample_size: usize,
+}
+
+impl Default for ReviewPreviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_size: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewConfig {
+    pub charts: ReviewChartConfig,
+    pub preview: ReviewPreviewConfig,
+    pub output_dir: PathBuf,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            charts: ReviewChartConfig::default(),
+            preview: ReviewPreviewConfig::default(),
+            output_dir: PathBuf::from("output/review"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewStats {
+    pub total_issues: usize,
+    pub ticker_count: usize,
+    pub issue_by_date: HashMap<String, usize>,
+    pub issue_by_category: HashMap<String, usize>,
+    pub issue_by_rule: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewChart {
+    pub chart_type: ReviewChartType,
+    pub title: String,
+    pub payload: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestedFix {
+    pub action: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPreviewItem {
+    pub issue: Issue,
+    pub suggested_fix: SuggestedFix,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewReport {
+    pub stats: ReviewStats,
+    pub charts: Vec<ReviewChart>,
+    pub preview: Vec<ReviewPreviewItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewOutput {
+    pub approved_issues: Vec<Issue>,
+    pub disabled_issues: Vec<Issue>,
+    pub review_report: ReviewReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DisableIssueRule {
+    pub issue_types: HashSet<IssueType>,
+    pub categories: HashSet<String>,
+    pub rule_names: HashSet<String>,
+    pub tickers: HashSet<String>,
+    pub dates: HashSet<String>,
+    pub fields: HashSet<String>,
+}
+
+impl DisableIssueRule {
+    pub fn matches(&self, issue: &Issue) -> bool {
+        if !self.issue_types.is_empty() && !self.issue_types.contains(&issue.issue_type) {
+            return false;
+        }
+        if !self.categories.is_empty() && !self.categories.contains(&issue.category) {
+            return false;
+        }
+        if !self.rule_names.is_empty() && !self.rule_names.contains(&issue.rule_name) {
+            return false;
+        }
+        if !self.tickers.is_empty() && !self.tickers.contains(&issue.ticker) {
+            return false;
+        }
+        if !self.dates.is_empty() && !self.dates.contains(&issue.date) {
+            return false;
+        }
+        if !self.fields.is_empty() && !self.fields.contains(&issue.field) {
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ReviewError {
+    #[error("failed to load disabled issue rules: {0}")]
+    DisabledRules(String),
+    #[error("chart generation failed: {0}")]
+    Chart(String),
+    #[error("preview generation failed: {0}")]
+    Preview(String),
+    #[error("report persistence failed: {0}")]
+    Persist(String),
+}
+
+pub trait DisabledIssueProvider: Send + Sync {
+    fn load_disabled_rules(&self, config: &ReviewConfig) -> Result<Vec<DisableIssueRule>, ReviewError>;
+}
+
+pub trait ReviewChartRenderer: Send + Sync {
+    fn render(&self, chart_type: ReviewChartType, issues: &[Issue], stats: &ReviewStats)
+        -> Result<ReviewChart, ReviewError>;
+}
+
+pub trait ReviewPreviewEngine: Send + Sync {
+    fn suggest_fix(&self, issue: &Issue) -> Result<SuggestedFix, ReviewError>;
+}
+
+pub trait ReviewReportStore: Send + Sync {
+    fn save(&self, report: &ReviewReport, config: &ReviewConfig) -> Result<(), ReviewError>;
+}
+
+pub trait ReviewStage: Send + Sync {
+    fn run(&self, issues: &[Issue], config: &ReviewConfig) -> Result<ReviewOutput, ReviewError>;
+}
+
+pub struct DefaultReviewStage<P, C, V, S>
+where
+    P: DisabledIssueProvider,
+    C: ReviewChartRenderer,
+    V: ReviewPreviewEngine,
+    S: ReviewReportStore,
+{
+    disabled_provider: P,
+    chart_renderer: C,
+    preview_engine: V,
+    report_store: S,
+}
+
+impl<P, C, V, S> DefaultReviewStage<P, C, V, S>
+where
+    P: DisabledIssueProvider,
+    C: ReviewChartRenderer,
+    V: ReviewPreviewEngine,
+    S: ReviewReportStore,
+{
+    pub fn new(disabled_provider: P, chart_renderer: C, preview_engine: V, report_store: S) -> Self {
+        Self {
+            disabled_provider,
+            chart_renderer,
+            preview_engine,
+            report_store,
+        }
+    }
+
+    fn summarize_issues(issues: &[Issue]) -> ReviewStats {
+        let mut issue_by_date = HashMap::new();
+        let mut issue_by_category = HashMap::new();
+        let mut issue_by_rule = HashMap::new();
+        let mut tickers = HashSet::new();
+
+        for issue in issues {
+            *issue_by_date.entry(issue.date.clone()).or_insert(0usize) += 1;
+            *issue_by_category
+                .entry(issue.category.clone())
+                .or_insert(0usize) += 1;
+            *issue_by_rule.entry(issue.rule_name.clone()).or_insert(0usize) += 1;
+            tickers.insert(issue.ticker.clone());
+        }
+
+        ReviewStats {
+            total_issues: issues.len(),
+            ticker_count: tickers.len(),
+            issue_by_date,
+            issue_by_category,
+            issue_by_rule,
+        }
+    }
+
+    fn preview_items(
+        &self,
+        issues: &[Issue],
+        config: &ReviewConfig,
+    ) -> Result<Vec<ReviewPreviewItem>, ReviewError> {
+        if !config.preview.enabled {
+            return Ok(Vec::new());
+        }
+
+        let sample_size = issues.len().min(config.preview.sample_size);
+        let mut out = Vec::with_capacity(sample_size);
+        for issue in issues.iter().take(sample_size) {
+            out.push(ReviewPreviewItem {
+                issue: issue.clone(),
+                suggested_fix: self.preview_engine.suggest_fix(issue)?,
+            });
+        }
+
+        Ok(out)
+    }
+}
+
+impl<P, C, V, S> ReviewStage for DefaultReviewStage<P, C, V, S>
+where
+    P: DisabledIssueProvider,
+    C: ReviewChartRenderer,
+    V: ReviewPreviewEngine,
+    S: ReviewReportStore,
+{
+    fn run(&self, issues: &[Issue], config: &ReviewConfig) -> Result<ReviewOutput, ReviewError> {
+        let stats = Self::summarize_issues(issues);
+
+        let mut charts = Vec::new();
+        if config.charts.enabled {
+            for chart_type in &config.charts.types {
+                charts.push(self.chart_renderer.render(*chart_type, issues, &stats)?);
+            }
+        }
+
+        let preview = self.preview_items(issues, config)?;
+
+        let review_report = ReviewReport {
+            stats,
+            charts,
+            preview,
+        };
+
+        self.report_store.save(&review_report, config)?;
+
+        let disabled_rules = self.disabled_provider.load_disabled_rules(config)?;
+        let mut approved_issues = Vec::new();
+        let mut disabled_issues = Vec::new();
+
+        for issue in issues {
+            if disabled_rules.iter().any(|rule| rule.matches(issue)) {
+                disabled_issues.push(issue.clone());
+            } else {
+                approved_issues.push(issue.clone());
+            }
+        }
+
+        Ok(ReviewOutput {
+            approved_issues,
+            disabled_issues,
+            review_report,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopDisabledIssueProvider;
+
+impl DisabledIssueProvider for NoopDisabledIssueProvider {
+    fn load_disabled_rules(&self, _config: &ReviewConfig) -> Result<Vec<DisableIssueRule>, ReviewError> {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopChartRenderer;
+
+impl ReviewChartRenderer for NoopChartRenderer {
+    fn render(
+        &self,
+        chart_type: ReviewChartType,
+        _issues: &[Issue],
+        _stats: &ReviewStats,
+    ) -> Result<ReviewChart, ReviewError> {
+        Ok(ReviewChart {
+            chart_type,
+            title: "placeholder".to_string(),
+            payload: "".to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopPreviewEngine;
+
+impl ReviewPreviewEngine for NoopPreviewEngine {
+    fn suggest_fix(&self, issue: &Issue) -> Result<SuggestedFix, ReviewError> {
+        Ok(SuggestedFix {
+            action: "no-op".to_string(),
+            reason: format!("preview unavailable for {}", issue.rule_name),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopReviewReportStore;
+
+impl ReviewReportStore for NoopReviewReportStore {
+    fn save(&self, _report: &ReviewReport, _config: &ReviewConfig) -> Result<(), ReviewError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunMode {
     ReviewOnly,
@@ -160,7 +493,7 @@ pub struct LoadOutput {
     pub load_errors: Vec<LoadError>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IssueType {
     MissingDates,
     DuplicateDate,
