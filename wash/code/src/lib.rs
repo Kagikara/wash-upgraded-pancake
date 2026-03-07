@@ -2673,3 +2673,636 @@ fn parse_csv_row(
         status,
     })
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PipelineStage {
+    Load,
+    Validate,
+    Review,
+    Clean,
+    Write,
+    LlmReport,
+    Versioning,
+    Error,
+}
+
+impl PipelineStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            PipelineStage::Load => "load",
+            PipelineStage::Validate => "validate",
+            PipelineStage::Review => "review",
+            PipelineStage::Clean => "clean",
+            PipelineStage::Write => "write",
+            PipelineStage::LlmReport => "llm_report",
+            PipelineStage::Versioning => "versioning",
+            PipelineStage::Error => "error",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "load" => Some(PipelineStage::Load),
+            "validate" => Some(PipelineStage::Validate),
+            "review" => Some(PipelineStage::Review),
+            "clean" => Some(PipelineStage::Clean),
+            "write" => Some(PipelineStage::Write),
+            "llm_report" => Some(PipelineStage::LlmReport),
+            "versioning" => Some(PipelineStage::Versioning),
+            "error" => Some(PipelineStage::Error),
+            _ => None,
+        }
+    }
+
+    fn next_stage(self) -> Option<Self> {
+        match self {
+            PipelineStage::Load => Some(PipelineStage::Validate),
+            PipelineStage::Validate => Some(PipelineStage::Review),
+            PipelineStage::Review => Some(PipelineStage::Clean),
+            PipelineStage::Clean => Some(PipelineStage::Write),
+            PipelineStage::Write => Some(PipelineStage::LlmReport),
+            PipelineStage::LlmReport => Some(PipelineStage::Versioning),
+            PipelineStage::Versioning => None,
+            PipelineStage::Error => Some(PipelineStage::Load),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersioningConfig {
+    pub history_dir: PathBuf,
+    pub head_file: String,
+    pub commits_dir: String,
+    pub checkpoint_dir: PathBuf,
+}
+
+impl Default for VersioningConfig {
+    fn default() -> Self {
+        Self {
+            history_dir: PathBuf::from(".history"),
+            head_file: "HEAD".to_string(),
+            commits_dir: "commits".to_string(),
+            checkpoint_dir: PathBuf::from(".checkpoint"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitMeta {
+    pub commit_id: String,
+    pub parent_commit_id: Option<String>,
+    pub author: String,
+    pub message: String,
+    pub created_at_epoch_ms: u128,
+    pub run_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitArtifacts {
+    pub config_yaml: PathBuf,
+    pub cleaned_csv: Option<PathBuf>,
+    pub audit_log_json: Option<PathBuf>,
+    pub audit_log_csv: Option<PathBuf>,
+    pub report_md: Option<PathBuf>,
+    pub summary_json: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionCommitInput {
+    pub author: String,
+    pub message: String,
+    pub run_mode: String,
+    pub artifacts: CommitArtifacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRecord {
+    pub run_id: String,
+    pub stage: PipelineStage,
+    pub created_at_epoch_ms: u128,
+    pub payload_path: PathBuf,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryPlan {
+    pub run_id: String,
+    pub resume_from: PipelineStage,
+    pub reason: String,
+}
+
+#[derive(Debug, Error)]
+pub enum VersioningError {
+    #[error("history store failed: {0}")]
+    Store(String),
+    #[error("commit id generation failed: {0}")]
+    CommitId(String),
+    #[error("rollback failed: {0}")]
+    Rollback(String),
+}
+
+#[derive(Debug, Error)]
+pub enum RecoveryError {
+    #[error("checkpoint save failed: {0}")]
+    Save(String),
+    #[error("checkpoint load failed: {0}")]
+    Load(String),
+    #[error("recovery planning failed: {0}")]
+    Plan(String),
+}
+
+pub trait CommitIdStrategy: Send + Sync {
+    fn next_id(
+        &self,
+        parent: Option<&str>,
+        input: &VersionCommitInput,
+    ) -> Result<String, VersioningError>;
+}
+
+pub trait HistoryStore: Send + Sync {
+    fn read_head(&self, cfg: &VersioningConfig) -> Result<Option<String>, VersioningError>;
+    fn write_head_atomic(&self, cfg: &VersioningConfig, commit_id: &str) -> Result<(), VersioningError>;
+    fn persist_commit(
+        &self,
+        cfg: &VersioningConfig,
+        meta: &CommitMeta,
+        artifacts: &CommitArtifacts,
+    ) -> Result<(), VersioningError>;
+    fn list_commits(&self, cfg: &VersioningConfig, limit: usize) -> Result<Vec<CommitMeta>, VersioningError>;
+}
+
+pub trait VersioningService: Send + Sync {
+    fn commit(&self, cfg: &VersioningConfig, input: VersionCommitInput) -> Result<String, VersioningError>;
+    fn rollback(&self, cfg: &VersioningConfig, target_commit_id: &str) -> Result<(), VersioningError>;
+    fn current_head(&self, cfg: &VersioningConfig) -> Result<Option<String>, VersioningError>;
+    fn log(&self, cfg: &VersioningConfig, limit: usize) -> Result<Vec<CommitMeta>, VersioningError>;
+}
+
+pub trait CheckpointStore: Send + Sync {
+    fn save(
+        &self,
+        cfg: &VersioningConfig,
+        run_id: &str,
+        stage: PipelineStage,
+        payload: &[u8],
+        error_message: Option<&str>,
+    ) -> Result<CheckpointRecord, RecoveryError>;
+    fn latest(&self, cfg: &VersioningConfig, run_id: &str) -> Result<Option<CheckpointRecord>, RecoveryError>;
+    fn load_payload(&self, record: &CheckpointRecord) -> Result<Vec<u8>, RecoveryError>;
+    fn clear_run(&self, cfg: &VersioningConfig, run_id: &str) -> Result<(), RecoveryError>;
+}
+
+pub trait RecoveryService: Send + Sync {
+    fn plan_resume(&self, cfg: &VersioningConfig, run_id: &str) -> Result<Option<RecoveryPlan>, RecoveryError>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EpochCommitIdStrategy;
+
+impl CommitIdStrategy for EpochCommitIdStrategy {
+    fn next_id(
+        &self,
+        parent: Option<&str>,
+        input: &VersionCommitInput,
+    ) -> Result<String, VersioningError> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let ts = now_epoch_millis();
+        let mut hasher = DefaultHasher::new();
+        input.author.hash(&mut hasher);
+        input.message.hash(&mut hasher);
+        input.run_mode.hash(&mut hasher);
+        if let Some(p) = parent {
+            p.hash(&mut hasher);
+        }
+        let suffix = hasher.finish();
+        Ok(format!("{ts}-{:08x}", suffix as u32))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileHistoryStore;
+
+impl FileHistoryStore {
+    fn commits_root(cfg: &VersioningConfig) -> PathBuf {
+        cfg.history_dir.join(&cfg.commits_dir)
+    }
+
+    fn commit_dir(cfg: &VersioningConfig, commit_id: &str) -> PathBuf {
+        Self::commits_root(cfg).join(commit_id)
+    }
+
+    fn head_path(cfg: &VersioningConfig) -> PathBuf {
+        cfg.history_dir.join(&cfg.head_file)
+    }
+
+    fn copy_required(from: &Path, to: &Path, name: &str) -> Result<(), VersioningError> {
+        if !from.exists() {
+            return Err(VersioningError::Store(format!(
+                "required artifact missing ({name}): {}",
+                from.display()
+            )));
+        }
+        fs::copy(from, to).map_err(|e| VersioningError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn copy_optional(from: &Option<PathBuf>, to: &Path) -> Result<(), VersioningError> {
+        if let Some(path) = from {
+            if !path.exists() {
+                return Err(VersioningError::Store(format!(
+                    "optional artifact declared but missing: {}",
+                    path.display()
+                )));
+            }
+            fs::copy(path, to).map_err(|e| VersioningError::Store(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn render_meta_json(meta: &CommitMeta) -> String {
+        let parent = meta
+            .parent_commit_id
+            .as_ref()
+            .map(|v| format!("\"{}\"", json_escape(v)))
+            .unwrap_or_else(|| "null".to_string());
+
+        format!(
+            "{{\n  \"commit_id\": \"{}\",\n  \"parent_commit_id\": {},\n  \"author\": \"{}\",\n  \"message\": \"{}\",\n  \"created_at_epoch_ms\": {},\n  \"run_mode\": \"{}\"\n}}\n",
+            json_escape(&meta.commit_id),
+            parent,
+            json_escape(&meta.author),
+            json_escape(&meta.message),
+            meta.created_at_epoch_ms,
+            json_escape(&meta.run_mode)
+        )
+    }
+
+    fn parse_meta_json(raw: &str) -> Option<CommitMeta> {
+        // Minimal parser for our own stable output shape.
+        fn extract(raw: &str, key: &str) -> Option<String> {
+            let marker = format!("\"{key}\":");
+            let idx = raw.find(&marker)? + marker.len();
+            let right = raw[idx..].trim_start();
+            if let Some(rest) = right.strip_prefix('"') {
+                let end = rest.find('"')?;
+                return Some(rest[..end].to_string());
+            }
+            if let Some(rest) = right.strip_prefix("null") {
+                let _ = rest;
+                return Some(String::new());
+            }
+            let end = right.find([',', '\n', '}']).unwrap_or(right.len());
+            Some(right[..end].trim().to_string())
+        }
+
+        let commit_id = extract(raw, "commit_id")?;
+        let parent_commit_id = match extract(raw, "parent_commit_id") {
+            Some(v) if v.is_empty() => None,
+            Some(v) => Some(v),
+            None => None,
+        };
+        let author = extract(raw, "author")?;
+        let message = extract(raw, "message")?;
+        let created_at_epoch_ms = extract(raw, "created_at_epoch_ms")?.parse::<u128>().ok()?;
+        let run_mode = extract(raw, "run_mode")?;
+
+        Some(CommitMeta {
+            commit_id,
+            parent_commit_id,
+            author,
+            message,
+            created_at_epoch_ms,
+            run_mode,
+        })
+    }
+}
+
+impl HistoryStore for FileHistoryStore {
+    fn read_head(&self, cfg: &VersioningConfig) -> Result<Option<String>, VersioningError> {
+        let head_path = Self::head_path(cfg);
+        if !head_path.exists() {
+            return Ok(None);
+        }
+
+        let raw = fs::read_to_string(&head_path).map_err(|e| VersioningError::Store(e.to_string()))?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+
+    fn write_head_atomic(&self, cfg: &VersioningConfig, commit_id: &str) -> Result<(), VersioningError> {
+        fs::create_dir_all(&cfg.history_dir).map_err(|e| VersioningError::Store(e.to_string()))?;
+        let head_path = Self::head_path(cfg);
+        let tmp_path = cfg.history_dir.join(format!("{}.tmp", cfg.head_file));
+        fs::write(&tmp_path, format!("{commit_id}\n")).map_err(|e| VersioningError::Store(e.to_string()))?;
+        fs::rename(&tmp_path, &head_path).map_err(|e| VersioningError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn persist_commit(
+        &self,
+        cfg: &VersioningConfig,
+        meta: &CommitMeta,
+        artifacts: &CommitArtifacts,
+    ) -> Result<(), VersioningError> {
+        fs::create_dir_all(Self::commits_root(cfg)).map_err(|e| VersioningError::Store(e.to_string()))?;
+
+        let commit_dir = Self::commit_dir(cfg, &meta.commit_id);
+        if commit_dir.exists() {
+            return Err(VersioningError::Store(format!(
+                "commit already exists: {}",
+                commit_dir.display()
+            )));
+        }
+        fs::create_dir_all(&commit_dir).map_err(|e| VersioningError::Store(e.to_string()))?;
+
+        Self::copy_required(
+            &artifacts.config_yaml,
+            &commit_dir.join("config.yaml"),
+            "config.yaml",
+        )?;
+        Self::copy_required(
+            &artifacts.summary_json,
+            &commit_dir.join("summary.json"),
+            "summary.json",
+        )?;
+        Self::copy_optional(&artifacts.cleaned_csv, &commit_dir.join("cleaned.csv"))?;
+        Self::copy_optional(&artifacts.audit_log_json, &commit_dir.join("audit_log.json"))?;
+        Self::copy_optional(&artifacts.audit_log_csv, &commit_dir.join("audit_log.csv"))?;
+        Self::copy_optional(&artifacts.report_md, &commit_dir.join("report.md"))?;
+
+        let meta_path = commit_dir.join("meta.json");
+        fs::write(&meta_path, Self::render_meta_json(meta)).map_err(|e| VersioningError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_commits(&self, cfg: &VersioningConfig, limit: usize) -> Result<Vec<CommitMeta>, VersioningError> {
+        let root = Self::commits_root(cfg);
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = fs::read_dir(&root)
+            .map_err(|e| VersioningError::Store(e.to_string()))?
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_dir())
+            .collect::<Vec<_>>();
+
+        entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        entries.reverse();
+
+        let mut out = Vec::new();
+        for entry in entries.into_iter().take(limit) {
+            let meta_path = entry.path().join("meta.json");
+            let raw = fs::read_to_string(&meta_path).map_err(|e| VersioningError::Store(e.to_string()))?;
+            if let Some(meta) = Self::parse_meta_json(&raw) {
+                out.push(meta);
+            }
+        }
+        Ok(out)
+    }
+}
+
+pub struct DefaultVersioningService<H, I>
+where
+    H: HistoryStore,
+    I: CommitIdStrategy,
+{
+    history: H,
+    id_strategy: I,
+}
+
+impl<H, I> DefaultVersioningService<H, I>
+where
+    H: HistoryStore,
+    I: CommitIdStrategy,
+{
+    pub fn new(history: H, id_strategy: I) -> Self {
+        Self {
+            history,
+            id_strategy,
+        }
+    }
+}
+
+impl<H, I> VersioningService for DefaultVersioningService<H, I>
+where
+    H: HistoryStore,
+    I: CommitIdStrategy,
+{
+    fn commit(&self, cfg: &VersioningConfig, input: VersionCommitInput) -> Result<String, VersioningError> {
+        let parent = self.history.read_head(cfg)?;
+        let commit_id = self.id_strategy.next_id(parent.as_deref(), &input)?;
+
+        let meta = CommitMeta {
+            commit_id: commit_id.clone(),
+            parent_commit_id: parent,
+            author: input.author,
+            message: input.message,
+            created_at_epoch_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_else(|_| Duration::from_millis(0))
+                .as_millis(),
+            run_mode: input.run_mode,
+        };
+
+        self.history.persist_commit(cfg, &meta, &input.artifacts)?;
+        self.history.write_head_atomic(cfg, &commit_id)?;
+        Ok(commit_id)
+    }
+
+    fn rollback(&self, cfg: &VersioningConfig, target_commit_id: &str) -> Result<(), VersioningError> {
+        let target_dir = FileHistoryStore::commit_dir(cfg, target_commit_id);
+        if !target_dir.exists() {
+            return Err(VersioningError::Rollback(format!(
+                "target commit not found: {target_commit_id}"
+            )));
+        }
+        self.history.write_head_atomic(cfg, target_commit_id)
+    }
+
+    fn current_head(&self, cfg: &VersioningConfig) -> Result<Option<String>, VersioningError> {
+        self.history.read_head(cfg)
+    }
+
+    fn log(&self, cfg: &VersioningConfig, limit: usize) -> Result<Vec<CommitMeta>, VersioningError> {
+        self.history.list_commits(cfg, limit)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileCheckpointStore;
+
+impl FileCheckpointStore {
+    fn run_dir(cfg: &VersioningConfig, run_id: &str) -> PathBuf {
+        cfg.checkpoint_dir.join(run_id)
+    }
+
+    fn payload_path(cfg: &VersioningConfig, run_id: &str, stage: PipelineStage) -> PathBuf {
+        Self::run_dir(cfg, run_id).join(format!("{}.payload", stage.as_str()))
+    }
+
+    fn meta_path(cfg: &VersioningConfig, run_id: &str, stage: PipelineStage) -> PathBuf {
+        Self::run_dir(cfg, run_id).join(format!("{}.meta", stage.as_str()))
+    }
+
+    fn write_meta(path: &Path, record: &CheckpointRecord) -> Result<(), RecoveryError> {
+        let text = format!(
+            "run_id={}\nstage={}\ncreated_at_epoch_ms={}\npayload_path={}\nerror_message={}\n",
+            record.run_id,
+            record.stage.as_str(),
+            record.created_at_epoch_ms,
+            record.payload_path.display(),
+            record.error_message.clone().unwrap_or_default()
+        );
+        fs::write(path, text).map_err(|e| RecoveryError::Save(e.to_string()))
+    }
+
+    fn read_meta(path: &Path) -> Result<CheckpointRecord, RecoveryError> {
+        let raw = fs::read_to_string(path).map_err(|e| RecoveryError::Load(e.to_string()))?;
+        let mut map = HashMap::<String, String>::new();
+        for line in raw.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+
+        let run_id = map
+            .get("run_id")
+            .cloned()
+            .ok_or_else(|| RecoveryError::Load("invalid checkpoint meta: missing run_id".to_string()))?;
+        let stage = map
+            .get("stage")
+            .and_then(|s| PipelineStage::from_str(s))
+            .ok_or_else(|| RecoveryError::Load("invalid checkpoint meta: missing stage".to_string()))?;
+        let created_at_epoch_ms = map
+            .get("created_at_epoch_ms")
+            .and_then(|v| v.parse::<u128>().ok())
+            .ok_or_else(|| RecoveryError::Load("invalid checkpoint meta: bad timestamp".to_string()))?;
+        let payload_path = map
+            .get("payload_path")
+            .map(PathBuf::from)
+            .ok_or_else(|| RecoveryError::Load("invalid checkpoint meta: missing payload_path".to_string()))?;
+        let error_message = map
+            .get("error_message")
+            .cloned()
+            .filter(|v| !v.trim().is_empty());
+
+        Ok(CheckpointRecord {
+            run_id,
+            stage,
+            created_at_epoch_ms,
+            payload_path,
+            error_message,
+        })
+    }
+
+    fn ordered_stages() -> [PipelineStage; 8] {
+        [
+            PipelineStage::Versioning,
+            PipelineStage::LlmReport,
+            PipelineStage::Write,
+            PipelineStage::Clean,
+            PipelineStage::Review,
+            PipelineStage::Validate,
+            PipelineStage::Load,
+            PipelineStage::Error,
+        ]
+    }
+}
+
+impl CheckpointStore for FileCheckpointStore {
+    fn save(
+        &self,
+        cfg: &VersioningConfig,
+        run_id: &str,
+        stage: PipelineStage,
+        payload: &[u8],
+        error_message: Option<&str>,
+    ) -> Result<CheckpointRecord, RecoveryError> {
+        let run_dir = Self::run_dir(cfg, run_id);
+        fs::create_dir_all(&run_dir).map_err(|e| RecoveryError::Save(e.to_string()))?;
+
+        let payload_path = Self::payload_path(cfg, run_id, stage);
+        fs::write(&payload_path, payload).map_err(|e| RecoveryError::Save(e.to_string()))?;
+
+        let record = CheckpointRecord {
+            run_id: run_id.to_string(),
+            stage,
+            created_at_epoch_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_else(|_| Duration::from_millis(0))
+                .as_millis(),
+            payload_path,
+            error_message: error_message.map(|v| v.to_string()),
+        };
+
+        let meta_path = Self::meta_path(cfg, run_id, stage);
+        Self::write_meta(&meta_path, &record)?;
+        Ok(record)
+    }
+
+    fn latest(&self, cfg: &VersioningConfig, run_id: &str) -> Result<Option<CheckpointRecord>, RecoveryError> {
+        for stage in Self::ordered_stages() {
+            let meta_path = Self::meta_path(cfg, run_id, stage);
+            if meta_path.exists() {
+                return Self::read_meta(&meta_path).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    fn load_payload(&self, record: &CheckpointRecord) -> Result<Vec<u8>, RecoveryError> {
+        fs::read(&record.payload_path).map_err(|e| RecoveryError::Load(e.to_string()))
+    }
+
+    fn clear_run(&self, cfg: &VersioningConfig, run_id: &str) -> Result<(), RecoveryError> {
+        let run_dir = Self::run_dir(cfg, run_id);
+        if run_dir.exists() {
+            fs::remove_dir_all(run_dir).map_err(|e| RecoveryError::Load(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+pub struct DefaultRecoveryService<C>
+where
+    C: CheckpointStore,
+{
+    checkpoint_store: C,
+}
+
+impl<C> DefaultRecoveryService<C>
+where
+    C: CheckpointStore,
+{
+    pub fn new(checkpoint_store: C) -> Self {
+        Self { checkpoint_store }
+    }
+}
+
+impl<C> RecoveryService for DefaultRecoveryService<C>
+where
+    C: CheckpointStore,
+{
+    fn plan_resume(&self, cfg: &VersioningConfig, run_id: &str) -> Result<Option<RecoveryPlan>, RecoveryError> {
+        let Some(latest) = self.checkpoint_store.latest(cfg, run_id)? else {
+            return Ok(None);
+        };
+
+        let Some(resume_from) = latest.stage.next_stage() else {
+            return Ok(None);
+        };
+
+        Ok(Some(RecoveryPlan {
+            run_id: run_id.to_string(),
+            resume_from,
+            reason: format!("latest checkpoint at stage: {}", latest.stage.as_str()),
+        }))
+    }
+}
