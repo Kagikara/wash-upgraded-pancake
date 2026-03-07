@@ -592,9 +592,31 @@ pub enum AuditActionSource {
     Loader,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditStage {
+    Load,
+    Validate,
+    Review,
+    Clean,
+    Write,
+}
+
+impl AuditStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "LOAD",
+            Self::Validate => "VALIDATE",
+            Self::Review => "REVIEW",
+            Self::Clean => "CLEAN",
+            Self::Write => "WRITE",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEntry {
     pub timestamp: String,
+    pub stage: AuditStage,
     pub ticker: String,
     pub date: String,
     pub issue_type: String,
@@ -627,6 +649,154 @@ pub struct CleanerOutput {
     pub audit_entries: Vec<AuditEntry>,
     pub processed_issues: usize,
     pub unresolved_issues: usize,
+}
+
+#[derive(Debug, Error)]
+pub enum AuditError {
+    #[error("failed to persist audit output: {0}")]
+    Persist(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct PerformanceSummaryInput<'a> {
+    pub total_rows: usize,
+    pub total_issues: usize,
+    pub disabled_issues: usize,
+    pub load_error_count: usize,
+    pub cleaner_output: &'a CleanerOutput,
+    pub total_time_ms: u128,
+    pub rule_time_breakdown: HashMap<String, u128>,
+}
+
+pub trait PerformanceSummaryBuilder: Send + Sync {
+    fn build(&self, input: PerformanceSummaryInput<'_>) -> PerformanceSummary;
+}
+
+pub trait AuditLogWriter: Send + Sync {
+    fn write(
+        &self,
+        audit_entries: &[AuditEntry],
+        performance_summary: &PerformanceSummary,
+        output_json: &Path,
+        output_csv: &Path,
+    ) -> Result<(), AuditError>;
+}
+
+pub trait AuditService: Send + Sync {
+    fn publish(
+        &self,
+        audit_entries: &[AuditEntry],
+        summary_input: PerformanceSummaryInput<'_>,
+        output_json: &Path,
+        output_csv: &Path,
+    ) -> Result<PerformanceSummary, AuditError>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultPerformanceSummaryBuilder;
+
+impl PerformanceSummaryBuilder for DefaultPerformanceSummaryBuilder {
+    fn build(&self, input: PerformanceSummaryInput<'_>) -> PerformanceSummary {
+        build_performance_summary(
+            input.total_rows,
+            input.total_issues,
+            input.disabled_issues,
+            input.load_error_count,
+            input.cleaner_output,
+            input.total_time_ms,
+            input.rule_time_breakdown,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileAuditLogWriter;
+
+impl AuditLogWriter for FileAuditLogWriter {
+    fn write(
+        &self,
+        audit_entries: &[AuditEntry],
+        performance_summary: &PerformanceSummary,
+        output_json: &Path,
+        output_csv: &Path,
+    ) -> Result<(), AuditError> {
+        if let Some(parent) = output_json.parent() {
+            fs::create_dir_all(parent).map_err(|e| AuditError::Persist(format!("{}", e)))?;
+        }
+        if let Some(parent) = output_csv.parent() {
+            fs::create_dir_all(parent).map_err(|e| AuditError::Persist(format!("{}", e)))?;
+        }
+
+        fs::write(output_json, render_audit_json(audit_entries, performance_summary)).map_err(|e| {
+            AuditError::Persist(format!("{}: {}", output_json.display(), e))
+        })?;
+
+        let mut csv_out = String::from(
+            "timestamp,stage,ticker,date,issue_type,category,rule_name,field,old_value,new_value,action,action_source,comment\n",
+        );
+        for entry in audit_entries {
+            csv_out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                csv_escape(&entry.timestamp),
+                csv_escape(entry.stage.as_str()),
+                csv_escape(&entry.ticker),
+                csv_escape(&entry.date),
+                csv_escape(&entry.issue_type),
+                csv_escape(&entry.category),
+                csv_escape(&entry.rule_name),
+                csv_escape(&entry.field),
+                csv_escape(&entry.old_value),
+                csv_escape(&entry.new_value),
+                csv_escape(&entry.action),
+                csv_escape(audit_action_source_name(entry.action_source)),
+                csv_escape(&entry.comment)
+            ));
+        }
+
+        fs::write(output_csv, csv_out)
+            .map_err(|e| AuditError::Persist(format!("{}: {}", output_csv.display(), e)))
+    }
+}
+
+pub struct DefaultAuditService<B, W>
+where
+    B: PerformanceSummaryBuilder,
+    W: AuditLogWriter,
+{
+    summary_builder: B,
+    writer: W,
+}
+
+impl<B, W> DefaultAuditService<B, W>
+where
+    B: PerformanceSummaryBuilder,
+    W: AuditLogWriter,
+{
+    pub fn new(summary_builder: B, writer: W) -> Self {
+        Self {
+            summary_builder,
+            writer,
+        }
+    }
+}
+
+impl<B, W> AuditService for DefaultAuditService<B, W>
+where
+    B: PerformanceSummaryBuilder,
+    W: AuditLogWriter,
+{
+    fn publish(
+        &self,
+        audit_entries: &[AuditEntry],
+        summary_input: PerformanceSummaryInput<'_>,
+        output_json: &Path,
+        output_csv: &Path,
+    ) -> Result<PerformanceSummary, AuditError> {
+        let performance_summary = self.summary_builder.build(summary_input);
+        self.writer
+            .write(audit_entries, &performance_summary, output_json, output_csv)?;
+        Ok(performance_summary)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -875,14 +1045,15 @@ impl LoadErrorAuditMapper for DefaultLoadErrorAuditMapper {
         for load_error in load_errors {
             out.push(AuditEntry {
                 timestamp: now_epoch_millis(),
+                stage: AuditStage::Load,
                 ticker: String::new(),
                 date: String::new(),
                 issue_type: "LOAD_ERROR".to_string(),
                 category: "Loader".to_string(),
                 rule_name: "Loader::parse_csv_row".to_string(),
-                field: String::new(),
-                old_value: String::new(),
-                new_value: String::new(),
+                field: "raw_row".to_string(),
+                old_value: load_error.raw_row.clone(),
+                new_value: load_error.raw_row.clone(),
                 action: "LOAD_ERROR".to_string(),
                 action_source: AuditActionSource::Loader,
                 comment: format!(
@@ -1027,6 +1198,7 @@ fn new_audit_entry(
 ) -> AuditEntry {
     AuditEntry {
         timestamp: now_epoch_millis(),
+        stage: AuditStage::Clean,
         ticker: issue.ticker.clone(),
         date: issue.date.clone(),
         issue_type: format!("{:?}", issue.issue_type),
@@ -1045,6 +1217,104 @@ fn now_epoch_millis() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_millis().to_string(),
         Err(_) => "0".to_string(),
+    }
+}
+
+fn audit_action_source_name(source: AuditActionSource) -> &'static str {
+    match source {
+        AuditActionSource::Auto => "AUTO",
+        AuditActionSource::Manual => "MANUAL",
+        AuditActionSource::Disabled => "DISABLED",
+        AuditActionSource::Loader => "LOADER",
+    }
+}
+
+fn render_audit_json(audit_entries: &[AuditEntry], performance_summary: &PerformanceSummary) -> String {
+    let mut out = String::new();
+    out.push_str("{\n  \"audit_entries\": [\n");
+
+    for (idx, entry) in audit_entries.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str("    {");
+        out.push_str(&format!(
+            "\"timestamp\":\"{}\",\"stage\":\"{}\",\"ticker\":\"{}\",\"date\":\"{}\",\"issue_type\":\"{}\",\"category\":\"{}\",\"rule_name\":\"{}\",\"field\":\"{}\",\"old_value\":\"{}\",\"new_value\":\"{}\",\"action\":\"{}\",\"action_source\":\"{}\",\"comment\":\"{}\"",
+            json_escape(&entry.timestamp),
+            json_escape(entry.stage.as_str()),
+            json_escape(&entry.ticker),
+            json_escape(&entry.date),
+            json_escape(&entry.issue_type),
+            json_escape(&entry.category),
+            json_escape(&entry.rule_name),
+            json_escape(&entry.field),
+            json_escape(&entry.old_value),
+            json_escape(&entry.new_value),
+            json_escape(&entry.action),
+            json_escape(audit_action_source_name(entry.action_source)),
+            json_escape(&entry.comment)
+        ));
+        out.push('}');
+    }
+
+    out.push_str("\n  ],\n");
+    out.push_str("  \"performance\": {\n");
+    out.push_str(&format!(
+        "    \"total_rows\": {},\n    \"load_error_count\": {},\n    \"total_issues\": {},\n    \"processed_issues\": {},\n    \"unresolved_issues\": {},\n    \"disabled_issues\": {},\n    \"total_time_ms\": {},\n    \"throughput_rows_per_sec\": {},\n    \"rule_time_breakdown\": {}\n",
+        performance_summary.total_rows,
+        performance_summary.load_error_count,
+        performance_summary.total_issues,
+        performance_summary.processed_issues,
+        performance_summary.unresolved_issues,
+        performance_summary.disabled_issues,
+        performance_summary.total_time_ms,
+        performance_summary.throughput_rows_per_sec,
+        render_rule_time_breakdown_json(&performance_summary.rule_time_breakdown)
+    ));
+    out.push_str("  }\n}\n");
+
+    out
+}
+
+fn render_rule_time_breakdown_json(rule_time_breakdown: &HashMap<String, u128>) -> String {
+    let mut pairs = rule_time_breakdown.iter().collect::<Vec<_>>();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut out = String::from("{");
+    for (idx, (rule_name, elapsed_ms)) in pairs.into_iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "\"{}\":{}",
+            json_escape(rule_name),
+            elapsed_ms
+        ));
+    }
+    out.push('}');
+    out
+}
+
+fn json_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn csv_escape(raw: &str) -> String {
+    if raw.contains(',') || raw.contains('"') || raw.contains('\n') || raw.contains('\r') {
+        format!("\"{}\"", raw.replace('"', "\"\""))
+    } else {
+        raw.to_string()
     }
 }
 
