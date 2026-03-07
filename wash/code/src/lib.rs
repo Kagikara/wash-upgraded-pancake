@@ -799,6 +799,331 @@ where
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmReportConfig {
+    pub enabled: bool,
+    pub model: String,
+    pub max_tokens: u32,
+    pub temperature_milli: u16,
+    pub output_path: PathBuf,
+    pub audit_csv_path: PathBuf,
+    pub max_sample_rows: usize,
+    pub top_k_issue_types: usize,
+    pub top_k_rules: usize,
+    pub fail_open: bool,
+}
+
+impl Default for LlmReportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: "gpt-4o-mini".to_string(),
+            max_tokens: 800,
+            temperature_milli: 200,
+            output_path: PathBuf::from("output/report.md"),
+            audit_csv_path: PathBuf::from("output/audit_log.csv"),
+            max_sample_rows: 500,
+            top_k_issue_types: 10,
+            top_k_rules: 10,
+            fail_open: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LlmReportSummary {
+    pub total_rows: usize,
+    pub total_issues: usize,
+    pub processed_issues: usize,
+    pub unresolved_issues: usize,
+    pub disabled_issues: usize,
+    pub load_error_count: usize,
+    pub time_cost_ms: u128,
+    pub throughput_rows_per_sec: u64,
+    pub top_issue_types: Vec<(String, usize)>,
+    pub top_rules: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmPromptInput {
+    pub summary: LlmReportSummary,
+    pub audit_csv_sample: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmGenerateRequest {
+    pub model: String,
+    pub prompt: String,
+    pub max_tokens: u32,
+    pub temperature_milli: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmGenerateResponse {
+    pub text: String,
+    pub usage_prompt_tokens: Option<u32>,
+    pub usage_completion_tokens: Option<u32>,
+    pub latency_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmReportOutput {
+    pub report_text: String,
+    pub report_path: PathBuf,
+}
+
+#[derive(Debug, Error)]
+pub enum LlmReportError {
+    #[error("summary build failed: {0}")]
+    Summary(String),
+    #[error("audit csv sample failed: {0}")]
+    Sample(String),
+    #[error("prompt build failed: {0}")]
+    Prompt(String),
+    #[error("llm request failed: {0}")]
+    Llm(String),
+    #[error("report persist failed: {0}")]
+    Persist(String),
+}
+
+pub trait ReportSummaryBuilder: Send + Sync {
+    fn build(
+        &self,
+        audit_entries: &[AuditEntry],
+        performance_summary: &PerformanceSummary,
+        config: &LlmReportConfig,
+    ) -> Result<LlmReportSummary, LlmReportError>;
+}
+
+pub trait AuditCsvSampler: Send + Sync {
+    fn sample_csv(&self, csv_path: &Path, max_rows: usize) -> Result<String, LlmReportError>;
+}
+
+pub trait PromptBuilder: Send + Sync {
+    fn build_prompt(&self, input: &LlmPromptInput) -> Result<String, LlmReportError>;
+}
+
+pub trait LlmClient: Send + Sync {
+    fn generate(&self, req: &LlmGenerateRequest) -> Result<LlmGenerateResponse, LlmReportError>;
+}
+
+pub trait LlmReportStore: Send + Sync {
+    fn save(&self, output_path: &Path, report_text: &str) -> Result<(), LlmReportError>;
+}
+
+pub trait LlmReportService: Send + Sync {
+    fn generate(
+        &self,
+        audit_entries: &[AuditEntry],
+        performance_summary: &PerformanceSummary,
+        config: &LlmReportConfig,
+    ) -> Result<Option<LlmReportOutput>, LlmReportError>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TopKSummaryBuilder;
+
+impl ReportSummaryBuilder for TopKSummaryBuilder {
+    fn build(
+        &self,
+        audit_entries: &[AuditEntry],
+        performance_summary: &PerformanceSummary,
+        config: &LlmReportConfig,
+    ) -> Result<LlmReportSummary, LlmReportError> {
+        let mut issue_type_counts: HashMap<String, usize> = HashMap::new();
+        let mut rule_counts: HashMap<String, usize> = HashMap::new();
+
+        for entry in audit_entries {
+            *issue_type_counts.entry(entry.issue_type.clone()).or_insert(0usize) += 1;
+            *rule_counts.entry(entry.rule_name.clone()).or_insert(0usize) += 1;
+        }
+
+        Ok(LlmReportSummary {
+            total_rows: performance_summary.total_rows,
+            total_issues: performance_summary.total_issues,
+            processed_issues: performance_summary.processed_issues,
+            unresolved_issues: performance_summary.unresolved_issues,
+            disabled_issues: performance_summary.disabled_issues,
+            load_error_count: performance_summary.load_error_count,
+            time_cost_ms: performance_summary.total_time_ms,
+            throughput_rows_per_sec: performance_summary.throughput_rows_per_sec,
+            top_issue_types: top_k_pairs(issue_type_counts, config.top_k_issue_types),
+            top_rules: top_k_pairs(rule_counts, config.top_k_rules),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileAuditCsvSampler;
+
+impl AuditCsvSampler for FileAuditCsvSampler {
+    fn sample_csv(&self, csv_path: &Path, max_rows: usize) -> Result<String, LlmReportError> {
+        let content = fs::read_to_string(csv_path)
+            .map_err(|e| LlmReportError::Sample(format!("{}: {}", csv_path.display(), e)))?;
+
+        let mut lines = content.lines();
+        let Some(header) = lines.next() else {
+            return Ok(String::new());
+        };
+
+        let mut out = String::new();
+        out.push_str(header);
+        out.push('\n');
+
+        for line in lines.take(max_rows) {
+            out.push_str(line);
+            out.push('\n');
+        }
+
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SimplePromptBuilder;
+
+impl PromptBuilder for SimplePromptBuilder {
+    fn build_prompt(&self, input: &LlmPromptInput) -> Result<String, LlmReportError> {
+        let mut out = String::new();
+        out.push_str("You are a data quality assistant. Based on summary and audit csv sample, produce a concise markdown report with sections: Overview, Key Findings, Risks, Suggestions.\n\n");
+        out.push_str("summary:\n");
+        out.push_str(&format!(
+            "total_rows: {}\ntotal_issues: {}\nprocessed_issues: {}\nunresolved_issues: {}\ndisabled_issues: {}\nload_error_count: {}\ntime_cost_ms: {}\nthroughput_rows_per_sec: {}\n",
+            input.summary.total_rows,
+            input.summary.total_issues,
+            input.summary.processed_issues,
+            input.summary.unresolved_issues,
+            input.summary.disabled_issues,
+            input.summary.load_error_count,
+            input.summary.time_cost_ms,
+            input.summary.throughput_rows_per_sec,
+        ));
+
+        out.push_str("top_issue_types:\n");
+        for (name, count) in &input.summary.top_issue_types {
+            out.push_str(&format!("- {}: {}\n", name, count));
+        }
+
+        out.push_str("top_rules:\n");
+        for (name, count) in &input.summary.top_rules {
+            out.push_str(&format!("- {}: {}\n", name, count));
+        }
+
+        out.push_str("\naudit_csv_sample:\n");
+        out.push_str(&input.audit_csv_sample);
+
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileLlmReportStore;
+
+impl LlmReportStore for FileLlmReportStore {
+    fn save(&self, output_path: &Path, report_text: &str) -> Result<(), LlmReportError> {
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| LlmReportError::Persist(format!("{}", e)))?;
+        }
+
+        fs::write(output_path, report_text)
+            .map_err(|e| LlmReportError::Persist(format!("{}: {}", output_path.display(), e)))
+    }
+}
+
+pub struct DefaultLlmReportService<S, A, P, C, W>
+where
+    S: ReportSummaryBuilder,
+    A: AuditCsvSampler,
+    P: PromptBuilder,
+    C: LlmClient,
+    W: LlmReportStore,
+{
+    summary_builder: S,
+    csv_sampler: A,
+    prompt_builder: P,
+    llm_client: C,
+    store: W,
+}
+
+impl<S, A, P, C, W> DefaultLlmReportService<S, A, P, C, W>
+where
+    S: ReportSummaryBuilder,
+    A: AuditCsvSampler,
+    P: PromptBuilder,
+    C: LlmClient,
+    W: LlmReportStore,
+{
+    pub fn new(summary_builder: S, csv_sampler: A, prompt_builder: P, llm_client: C, store: W) -> Self {
+        Self {
+            summary_builder,
+            csv_sampler,
+            prompt_builder,
+            llm_client,
+            store,
+        }
+    }
+}
+
+impl<S, A, P, C, W> LlmReportService for DefaultLlmReportService<S, A, P, C, W>
+where
+    S: ReportSummaryBuilder,
+    A: AuditCsvSampler,
+    P: PromptBuilder,
+    C: LlmClient,
+    W: LlmReportStore,
+{
+    fn generate(
+        &self,
+        audit_entries: &[AuditEntry],
+        performance_summary: &PerformanceSummary,
+        config: &LlmReportConfig,
+    ) -> Result<Option<LlmReportOutput>, LlmReportError> {
+        if !config.enabled {
+            return Ok(None);
+        }
+
+        let run = || -> Result<LlmReportOutput, LlmReportError> {
+            let summary = self
+                .summary_builder
+                .build(audit_entries, performance_summary, config)?;
+            let audit_csv_sample = self
+                .csv_sampler
+                .sample_csv(&config.audit_csv_path, config.max_sample_rows)?;
+
+            let prompt = self.prompt_builder.build_prompt(&LlmPromptInput {
+                summary,
+                audit_csv_sample,
+            })?;
+
+            let resp = self.llm_client.generate(&LlmGenerateRequest {
+                model: config.model.clone(),
+                prompt,
+                max_tokens: config.max_tokens,
+                temperature_milli: config.temperature_milli,
+            })?;
+
+            self.store.save(&config.output_path, &resp.text)?;
+
+            Ok(LlmReportOutput {
+                report_text: resp.text,
+                report_path: config.output_path.clone(),
+            })
+        };
+
+        match run() {
+            Ok(output) => Ok(Some(output)),
+            Err(e) if config.fail_open => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+fn top_k_pairs(counts: HashMap<String, usize>, k: usize) -> Vec<(String, usize)> {
+    let mut pairs = counts.into_iter().collect::<Vec<_>>();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pairs.into_iter().take(k).collect()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyApplyResult {
     pub action: String,
