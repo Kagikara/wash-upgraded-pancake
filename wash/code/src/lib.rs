@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -339,6 +340,711 @@ pub struct NoopReviewReportStore;
 impl ReviewReportStore for NoopReviewReportStore {
     fn save(&self, _report: &ReviewReport, _config: &ReviewConfig) -> Result<(), ReviewError> {
         Ok(())
+    }
+}
+
+pub const REVIEW_DISABLED_RULES_FILE: &str = "disabled_issues.yaml";
+pub const REVIEW_REPORT_FILE: &str = "review_report.txt";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDisabledIssueProvider {
+    pub file_name: String,
+}
+
+impl Default for FileDisabledIssueProvider {
+    fn default() -> Self {
+        Self {
+            file_name: REVIEW_DISABLED_RULES_FILE.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDisabledRulesFile {
+    #[serde(default)]
+    rules: Vec<RawDisableIssueRule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDisableIssueRule {
+    #[serde(default)]
+    issue_types: Vec<String>,
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(default)]
+    rule_names: Vec<String>,
+    #[serde(default)]
+    tickers: Vec<String>,
+    #[serde(default)]
+    dates: Vec<String>,
+    #[serde(default)]
+    fields: Vec<String>,
+}
+
+impl DisabledIssueProvider for FileDisabledIssueProvider {
+    fn load_disabled_rules(&self, config: &ReviewConfig) -> Result<Vec<DisableIssueRule>, ReviewError> {
+        let path = config.output_dir.join(&self.file_name);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&path)
+            .map_err(|e| ReviewError::DisabledRules(format!("{}: {}", path.display(), e)))?;
+
+        let raw: RawDisabledRulesFile = serde_yaml::from_str(&content)
+            .map_err(|e| ReviewError::DisabledRules(format!("{}: {}", path.display(), e)))?;
+
+        let mut rules = Vec::with_capacity(raw.rules.len());
+        for entry in raw.rules {
+            let mut issue_types = HashSet::new();
+            for raw_issue_type in entry.issue_types {
+                let parsed = parse_issue_type(&raw_issue_type).ok_or_else(|| {
+                    ReviewError::DisabledRules(format!(
+                        "unknown issue type in {}: {}",
+                        path.display(),
+                        raw_issue_type
+                    ))
+                })?;
+                issue_types.insert(parsed);
+            }
+
+            rules.push(DisableIssueRule {
+                issue_types,
+                categories: entry.categories.into_iter().collect(),
+                rule_names: entry.rule_names.into_iter().collect(),
+                tickers: entry.tickers.into_iter().collect(),
+                dates: entry.dates.into_iter().collect(),
+                fields: entry.fields.into_iter().collect(),
+            });
+        }
+
+        Ok(rules)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BasicReviewChartRenderer;
+
+impl ReviewChartRenderer for BasicReviewChartRenderer {
+    fn render(
+        &self,
+        chart_type: ReviewChartType,
+        _issues: &[Issue],
+        stats: &ReviewStats,
+    ) -> Result<ReviewChart, ReviewError> {
+        let (title, payload) = match chart_type {
+            ReviewChartType::IssueByDate => {
+                ("Issue Count By Date".to_string(), format_kv_map(&stats.issue_by_date))
+            }
+            ReviewChartType::IssueByCategory => (
+                "Issue Count By Category".to_string(),
+                format_kv_map(&stats.issue_by_category),
+            ),
+            ReviewChartType::IssueByRule => {
+                ("Issue Count By Rule".to_string(), format_kv_map(&stats.issue_by_rule))
+            }
+        };
+
+        Ok(ReviewChart {
+            chart_type,
+            title,
+            payload,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuleBasedPreviewEngine {
+    suggestions: HashMap<IssueType, SuggestedFix>,
+}
+
+impl Default for RuleBasedPreviewEngine {
+    fn default() -> Self {
+        let mut suggestions = HashMap::new();
+        suggestions.insert(
+            IssueType::DuplicateDate,
+            SuggestedFix {
+                action: "drop-duplicate".to_string(),
+                reason: "keep first valid row for same ticker/date".to_string(),
+            },
+        );
+        suggestions.insert(
+            IssueType::NegativePrice,
+            SuggestedFix {
+                action: "set-null".to_string(),
+                reason: "negative prices are invalid market values".to_string(),
+            },
+        );
+        suggestions.insert(
+            IssueType::VwapOutOfRange,
+            SuggestedFix {
+                action: "clamp".to_string(),
+                reason: "limit VWAP to [low, high] interval".to_string(),
+            },
+        );
+
+        Self { suggestions }
+    }
+}
+
+impl ReviewPreviewEngine for RuleBasedPreviewEngine {
+    fn suggest_fix(&self, issue: &Issue) -> Result<SuggestedFix, ReviewError> {
+        Ok(self
+            .suggestions
+            .get(&issue.issue_type)
+            .cloned()
+            .unwrap_or(SuggestedFix {
+                action: "manual-review".to_string(),
+                reason: format!("no built-in simulation for {}", issue.rule_name),
+            }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileReviewReportStore {
+    pub file_name: String,
+}
+
+impl Default for FileReviewReportStore {
+    fn default() -> Self {
+        Self {
+            file_name: REVIEW_REPORT_FILE.to_string(),
+        }
+    }
+}
+
+impl ReviewReportStore for FileReviewReportStore {
+    fn save(&self, report: &ReviewReport, config: &ReviewConfig) -> Result<(), ReviewError> {
+        fs::create_dir_all(&config.output_dir)
+            .map_err(|e| ReviewError::Persist(format!("{}", e)))?;
+
+        let path = config.output_dir.join(&self.file_name);
+        let mut out = String::new();
+        out.push_str("[stats]\n");
+        out.push_str(&format!("total_issues: {}\n", report.stats.total_issues));
+        out.push_str(&format!("ticker_count: {}\n", report.stats.ticker_count));
+        out.push_str("issue_by_date:\n");
+        out.push_str(&format_kv_map(&report.stats.issue_by_date));
+        out.push_str("\nissue_by_category:\n");
+        out.push_str(&format_kv_map(&report.stats.issue_by_category));
+        out.push_str("\nissue_by_rule:\n");
+        out.push_str(&format_kv_map(&report.stats.issue_by_rule));
+        out.push_str("\n[charts]\n");
+        for chart in &report.charts {
+            out.push_str(&format!("- {}\n", chart.title));
+            if !chart.payload.is_empty() {
+                out.push_str(&chart.payload);
+                out.push('\n');
+            }
+        }
+        out.push_str("[preview]\n");
+        for item in &report.preview {
+            out.push_str(&format!(
+                "- rule={}, ticker={}, date={}, action={}, reason={}\n",
+                item.issue.rule_name,
+                item.issue.ticker,
+                item.issue.date,
+                item.suggested_fix.action,
+                item.suggested_fix.reason
+            ));
+        }
+
+        fs::write(&path, out).map_err(|e| ReviewError::Persist(format!("{}: {}", path.display(), e)))
+    }
+}
+
+fn format_kv_map(map: &HashMap<String, usize>) -> String {
+    let mut pairs = map.iter().collect::<Vec<_>>();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut out = String::new();
+    for (key, value) in pairs {
+        out.push_str(&format!("{}: {}\n", key, value));
+    }
+    out
+}
+
+fn parse_issue_type(raw: &str) -> Option<IssueType> {
+    let normalized = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "missingdates" => Some(IssueType::MissingDates),
+        "duplicatedate" | "duplicatedates" => Some(IssueType::DuplicateDate),
+        "nontradingdaydata" => Some(IssueType::NonTradingDayData),
+        "highbelowothers" => Some(IssueType::HighBelowOthers),
+        "lowaboveothers" => Some(IssueType::LowAboveOthers),
+        "negativeprice" => Some(IssueType::NegativePrice),
+        "invalidticksize" => Some(IssueType::InvalidTickSize),
+        "vwapoutofrange" => Some(IssueType::VwapOutOfRange),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditActionSource {
+    Auto,
+    Manual,
+    Disabled,
+    Loader,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEntry {
+    pub timestamp: String,
+    pub ticker: String,
+    pub date: String,
+    pub issue_type: String,
+    pub category: String,
+    pub rule_name: String,
+    pub field: String,
+    pub old_value: String,
+    pub new_value: String,
+    pub action: String,
+    pub action_source: AuditActionSource,
+    pub comment: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerformanceSummary {
+    pub total_rows: usize,
+    pub total_issues: usize,
+    pub processed_issues: usize,
+    pub unresolved_issues: usize,
+    pub disabled_issues: usize,
+    pub load_error_count: usize,
+    pub total_time_ms: u128,
+    pub throughput_rows_per_sec: u64,
+    pub rule_time_breakdown: HashMap<String, u128>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CleanerOutput {
+    pub cleaned_records: Vec<Record>,
+    pub audit_entries: Vec<AuditEntry>,
+    pub processed_issues: usize,
+    pub unresolved_issues: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyApplyResult {
+    pub action: String,
+    pub old_value: String,
+    pub new_value: String,
+    pub action_source: AuditActionSource,
+    pub comment: String,
+}
+
+#[derive(Debug, Error)]
+pub enum CleanerError {
+    #[error("invalid issue field: {0}")]
+    UnknownField(String),
+    #[error("policy execution failed for {rule_name}: {detail}")]
+    PolicyExecution { rule_name: String, detail: String },
+}
+
+pub trait PolicyResolver: Send + Sync {
+    fn resolve_policy(&self, issue: &Issue, handling: &HandlingConfig) -> Option<PolicyConfig>;
+}
+
+pub trait PolicyExecutor: Send + Sync {
+    fn apply_policy(
+        &self,
+        record: &mut Record,
+        issue: &Issue,
+        policy: &PolicyConfig,
+    ) -> Result<PolicyApplyResult, CleanerError>;
+}
+
+pub trait LoadErrorAuditMapper: Send + Sync {
+    fn map(&self, load_errors: &[LoadError]) -> Vec<AuditEntry>;
+}
+
+pub trait CleanerStage: Send + Sync {
+    fn run(
+        &self,
+        records: &[Record],
+        approved_issues: &[Issue],
+        load_errors: &[LoadError],
+        handling: &HandlingConfig,
+    ) -> Result<CleanerOutput, CleanerError>;
+}
+
+pub struct DefaultCleanerStage<R, E, M>
+where
+    R: PolicyResolver,
+    E: PolicyExecutor,
+    M: LoadErrorAuditMapper,
+{
+    resolver: R,
+    executor: E,
+    load_error_mapper: M,
+}
+
+impl<R, E, M> DefaultCleanerStage<R, E, M>
+where
+    R: PolicyResolver,
+    E: PolicyExecutor,
+    M: LoadErrorAuditMapper,
+{
+    pub fn new(resolver: R, executor: E, load_error_mapper: M) -> Self {
+        Self {
+            resolver,
+            executor,
+            load_error_mapper,
+        }
+    }
+
+    fn issue_index(issues: &[Issue]) -> HashMap<(String, String), Vec<Issue>> {
+        let mut out: HashMap<(String, String), Vec<Issue>> = HashMap::new();
+        for issue in issues {
+            out.entry((issue.ticker.clone(), issue.date.clone()))
+                .or_default()
+                .push(issue.clone());
+        }
+        out
+    }
+}
+
+impl<R, E, M> CleanerStage for DefaultCleanerStage<R, E, M>
+where
+    R: PolicyResolver,
+    E: PolicyExecutor,
+    M: LoadErrorAuditMapper,
+{
+    fn run(
+        &self,
+        records: &[Record],
+        approved_issues: &[Issue],
+        load_errors: &[LoadError],
+        handling: &HandlingConfig,
+    ) -> Result<CleanerOutput, CleanerError> {
+        let mut cleaned_records = records.to_vec();
+        let mut audit_entries = self.load_error_mapper.map(load_errors);
+        let issue_index = Self::issue_index(approved_issues);
+
+        let mut processed_issues = 0usize;
+        let mut unresolved_issues = 0usize;
+
+        for record in &mut cleaned_records {
+            let key = (record.ticker.clone(), record.date.clone());
+            let Some(issues) = issue_index.get(&key) else {
+                continue;
+            };
+
+            for issue in issues {
+                let old_value = record_field_value(record, &issue.field)?;
+
+                let Some(policy) = self.resolver.resolve_policy(issue, handling) else {
+                    unresolved_issues += 1;
+                    audit_entries.push(new_audit_entry(
+                        issue,
+                        old_value.clone(),
+                        old_value,
+                        "UNRESOLVED".to_string(),
+                        AuditActionSource::Disabled,
+                        "No policy configured for this issue".to_string(),
+                    ));
+                    continue;
+                };
+
+                let applied = self.executor.apply_policy(record, issue, &policy)?;
+                processed_issues += 1;
+                audit_entries.push(new_audit_entry(
+                    issue,
+                    applied.old_value,
+                    applied.new_value,
+                    applied.action,
+                    applied.action_source,
+                    applied.comment,
+                ));
+            }
+        }
+
+        Ok(CleanerOutput {
+            cleaned_records,
+            audit_entries,
+            processed_issues,
+            unresolved_issues,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RuleNamePolicyResolver;
+
+impl PolicyResolver for RuleNamePolicyResolver {
+    fn resolve_policy(&self, issue: &Issue, handling: &HandlingConfig) -> Option<PolicyConfig> {
+        handling
+            .policies
+            .iter()
+            .find(|p| p.rule_name == issue.rule_name)
+            .cloned()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopPolicyExecutor;
+
+impl PolicyExecutor for NoopPolicyExecutor {
+    fn apply_policy(
+        &self,
+        record: &mut Record,
+        issue: &Issue,
+        policy: &PolicyConfig,
+    ) -> Result<PolicyApplyResult, CleanerError> {
+        let old_value = record_field_value(record, &issue.field)?;
+        Ok(PolicyApplyResult {
+            action: policy.action.clone(),
+            old_value: old_value.clone(),
+            new_value: old_value,
+            action_source: AuditActionSource::Auto,
+            comment: "Noop executor did not change record".to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuiltinPolicyExecutor;
+
+impl PolicyExecutor for BuiltinPolicyExecutor {
+    fn apply_policy(
+        &self,
+        record: &mut Record,
+        issue: &Issue,
+        policy: &PolicyConfig,
+    ) -> Result<PolicyApplyResult, CleanerError> {
+        let old_value = record_field_value(record, &issue.field)?;
+
+        match policy.action.as_str() {
+            "set_literal" => {
+                let value_raw = required_param_str(policy, "value")?;
+                set_record_field(record, &issue.field, value_raw)?;
+
+                Ok(PolicyApplyResult {
+                    action: policy.action.clone(),
+                    old_value,
+                    new_value: record_field_value(record, &issue.field)?,
+                    action_source: AuditActionSource::Auto,
+                    comment: format!("set {} with literal value", issue.field),
+                })
+            }
+            "clamp_field" => {
+                let min_field = required_param_str(policy, "min_field")?;
+                let max_field = required_param_str(policy, "max_field")?;
+
+                let min = parse_decimal_field(record, min_field)?;
+                let max = parse_decimal_field(record, max_field)?;
+                let value = parse_decimal_field(record, &issue.field)?;
+
+                let clamped = if value < min {
+                    min
+                } else if value > max {
+                    max
+                } else {
+                    value
+                };
+
+                set_record_field(record, &issue.field, &clamped.to_string())?;
+
+                Ok(PolicyApplyResult {
+                    action: policy.action.clone(),
+                    old_value,
+                    new_value: record_field_value(record, &issue.field)?,
+                    action_source: AuditActionSource::Auto,
+                    comment: format!("clamped {} to [{}, {}]", issue.field, min_field, max_field),
+                })
+            }
+            other => Err(CleanerError::PolicyExecution {
+                rule_name: issue.rule_name.clone(),
+                detail: format!("unsupported action: {other}"),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultLoadErrorAuditMapper;
+
+impl LoadErrorAuditMapper for DefaultLoadErrorAuditMapper {
+    fn map(&self, load_errors: &[LoadError]) -> Vec<AuditEntry> {
+        let mut out = Vec::with_capacity(load_errors.len());
+        for load_error in load_errors {
+            out.push(AuditEntry {
+                timestamp: now_epoch_millis(),
+                ticker: String::new(),
+                date: String::new(),
+                issue_type: "LOAD_ERROR".to_string(),
+                category: "Loader".to_string(),
+                rule_name: "Loader::parse_csv_row".to_string(),
+                field: String::new(),
+                old_value: String::new(),
+                new_value: String::new(),
+                action: "LOAD_ERROR".to_string(),
+                action_source: AuditActionSource::Loader,
+                comment: format!(
+                    "row={}, code={:?}, detail={}",
+                    load_error.row_number, load_error.error_code, load_error.error_detail
+                ),
+            });
+        }
+        out
+    }
+}
+
+pub fn build_performance_summary(
+    total_rows: usize,
+    total_issues: usize,
+    disabled_issues: usize,
+    load_error_count: usize,
+    cleaner_output: &CleanerOutput,
+    total_time_ms: u128,
+    rule_time_breakdown: HashMap<String, u128>,
+) -> PerformanceSummary {
+    let throughput_rows_per_sec = if total_time_ms == 0 {
+        0
+    } else {
+        ((total_rows as u128 * 1000u128) / total_time_ms) as u64
+    };
+
+    PerformanceSummary {
+        total_rows,
+        total_issues,
+        processed_issues: cleaner_output.processed_issues,
+        unresolved_issues: cleaner_output.unresolved_issues,
+        disabled_issues,
+        load_error_count,
+        total_time_ms,
+        throughput_rows_per_sec,
+        rule_time_breakdown,
+    }
+}
+
+fn record_field_value(record: &Record, field: &str) -> Result<String, CleanerError> {
+    match field {
+        "date" => Ok(record.date.clone()),
+        "ticker" => Ok(record.ticker.clone()),
+        "open" => Ok(record.open.to_string()),
+        "high" => Ok(record.high.to_string()),
+        "low" => Ok(record.low.to_string()),
+        "close" => Ok(record.close.to_string()),
+        "vwap" => Ok(record.vwap.to_string()),
+        "volume" => Ok(record.volume.to_string()),
+        "turnover" => Ok(record.turnover.to_string()),
+        "status" => Ok(format!("{:?}", record.status)),
+        other => Err(CleanerError::UnknownField(other.to_string())),
+    }
+}
+
+fn set_record_field(record: &mut Record, field: &str, value: &str) -> Result<(), CleanerError> {
+    match field {
+        "date" => {
+            record.date = value.to_string();
+            Ok(())
+        }
+        "ticker" => {
+            record.ticker = value.to_string();
+            Ok(())
+        }
+        "open" => {
+            record.open = parse_decimal_literal(value, field)?;
+            Ok(())
+        }
+        "high" => {
+            record.high = parse_decimal_literal(value, field)?;
+            Ok(())
+        }
+        "low" => {
+            record.low = parse_decimal_literal(value, field)?;
+            Ok(())
+        }
+        "close" => {
+            record.close = parse_decimal_literal(value, field)?;
+            Ok(())
+        }
+        "vwap" => {
+            record.vwap = parse_decimal_literal(value, field)?;
+            Ok(())
+        }
+        "volume" => {
+            record.volume = value.parse::<i64>().map_err(|_| CleanerError::PolicyExecution {
+                rule_name: "PolicyParam".to_string(),
+                detail: format!("invalid int literal for volume: {value}"),
+            })?;
+            Ok(())
+        }
+        "turnover" => {
+            record.turnover = value.parse::<i64>().map_err(|_| CleanerError::PolicyExecution {
+                rule_name: "PolicyParam".to_string(),
+                detail: format!("invalid int literal for turnover: {value}"),
+            })?;
+            Ok(())
+        }
+        "status" => {
+            record.status = TradeStatus::parse(value);
+            Ok(())
+        }
+        other => Err(CleanerError::UnknownField(other.to_string())),
+    }
+}
+
+fn parse_decimal_literal(raw: &str, field: &str) -> Result<Decimal, CleanerError> {
+    Decimal::from_str(raw).map_err(|_| CleanerError::PolicyExecution {
+        rule_name: "PolicyParam".to_string(),
+        detail: format!("invalid decimal literal for {field}: {raw}"),
+    })
+}
+
+fn required_param_str<'a>(policy: &'a PolicyConfig, key: &str) -> Result<&'a str, CleanerError> {
+    policy
+        .params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CleanerError::PolicyExecution {
+            rule_name: policy.rule_name.clone(),
+            detail: format!("missing or invalid string param: {key}"),
+        })
+}
+
+fn parse_decimal_field(record: &Record, field: &str) -> Result<Decimal, CleanerError> {
+    let raw = record_field_value(record, field)?;
+    Decimal::from_str(&raw).map_err(|_| CleanerError::PolicyExecution {
+        rule_name: "PolicyParam".to_string(),
+        detail: format!("field is not decimal-compatible: {field}"),
+    })
+}
+
+fn new_audit_entry(
+    issue: &Issue,
+    old_value: String,
+    new_value: String,
+    action: String,
+    action_source: AuditActionSource,
+    comment: String,
+) -> AuditEntry {
+    AuditEntry {
+        timestamp: now_epoch_millis(),
+        ticker: issue.ticker.clone(),
+        date: issue.date.clone(),
+        issue_type: format!("{:?}", issue.issue_type),
+        category: issue.category.clone(),
+        rule_name: issue.rule_name.clone(),
+        field: issue.field.clone(),
+        old_value,
+        new_value,
+        action,
+        action_source,
+        comment,
+    }
+}
+
+fn now_epoch_millis() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis().to_string(),
+        Err(_) => "0".to_string(),
     }
 }
 
