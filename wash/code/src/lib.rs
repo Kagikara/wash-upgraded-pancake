@@ -1248,6 +1248,10 @@ where
         let mut cleaned_records = records.to_vec();
         let mut audit_entries = self.load_error_mapper.map(load_errors);
         let issue_index = Self::issue_index(approved_issues);
+        let record_keys = cleaned_records
+            .iter()
+            .map(|r| (r.ticker.clone(), r.date.clone()))
+            .collect::<HashSet<_>>();
 
         let mut processed_issues = 0usize;
         let mut unresolved_issues = 0usize;
@@ -1287,6 +1291,25 @@ where
                     applied.comment,
                 ));
             }
+        }
+
+        // Some issues (for example MissingDatesRule) may reference synthetic
+        // dates with no physical record row. Keep them auditable as unresolved.
+        for issue in approved_issues {
+            let key = (issue.ticker.clone(), issue.date.clone());
+            if record_keys.contains(&key) {
+                continue;
+            }
+
+            unresolved_issues += 1;
+            audit_entries.push(new_audit_entry(
+                issue,
+                issue.value.clone(),
+                issue.value.clone(),
+                "UNRESOLVED".to_string(),
+                AuditActionSource::Disabled,
+                "No matching record found for this issue key".to_string(),
+            ));
         }
 
         Ok(CleanerOutput {
@@ -2470,13 +2493,15 @@ pub fn load_and_validate_config(path: &Path, registry: &dyn RuleRegistry) -> Res
         return Err(ConfigError::NotFound(path.display().to_string()));
     }
 
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
     let content = fs::read_to_string(path).map_err(|e| ConfigError::InvalidYaml(e.to_string()))?;
     let raw: RawConfig = serde_yaml::from_str(&content).map_err(|e| ConfigError::InvalidYaml(e.to_string()))?;
 
     let mode = RunMode::parse(&raw.mode)?;
     let format = InputFormat::parse(&raw.input.format)?;
 
-    let input_path = PathBuf::from(raw.input.path);
+    let input_path = resolve_config_path(base_dir, &raw.input.path);
     if input_path.as_os_str().is_empty() {
         return Err(ConfigError::Schema("input.path cannot be empty".to_string()));
     }
@@ -2500,25 +2525,27 @@ pub fn load_and_validate_config(path: &Path, registry: &dyn RuleRegistry) -> Res
         .calendar
         .and_then(|n| n.trading_calendar_path)
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "data/default_trading_calendar.csv".to_string());
+        .map(|s| resolve_config_path(base_dir, &s))
+        .unwrap_or_else(|| resolve_config_path(base_dir, "data/default_trading_calendar.csv"));
 
     let market_rules_path = raw
         .market_rules
         .and_then(|n| n.path)
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "data/default_market_rules.yaml".to_string());
+        .map(|s| resolve_config_path(base_dir, &s))
+        .unwrap_or_else(|| resolve_config_path(base_dir, "data/default_market_rules.yaml"));
 
     let corporate_actions = raw
         .corporate_actions
         .and_then(|n| n.path)
         .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from);
+        .map(|s| resolve_config_path(base_dir, &s));
 
     let lifecycle_map = raw
         .lifecycle_map
         .and_then(|n| n.path)
         .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from);
+        .map(|s| resolve_config_path(base_dir, &s));
 
     let all_categories = registry.all_categories();
     for c in &raw.rules.enabled_categories {
@@ -2563,10 +2590,10 @@ pub fn load_and_validate_config(path: &Path, registry: &dyn RuleRegistry) -> Res
             schema,
         },
         calendar: CalendarConfig {
-            trading_calendar_path: PathBuf::from(calendar_path),
+            trading_calendar_path: calendar_path,
         },
         market_rules: RuleSourceConfig {
-            path: PathBuf::from(market_rules_path),
+            path: market_rules_path,
         },
         corporate_actions,
         lifecycle_map,
@@ -2577,6 +2604,15 @@ pub fn load_and_validate_config(path: &Path, registry: &dyn RuleRegistry) -> Res
         },
         handling: HandlingConfig { policies },
     })
+}
+
+fn resolve_config_path(base_dir: &Path, raw: &str) -> PathBuf {
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        p
+    } else {
+        base_dir.join(p)
+    }
 }
 
 pub fn load_data(cfg: &LoadConfig) -> Result<LoadOutput, LoadStageError> {

@@ -243,3 +243,90 @@ fn cleaner_returns_policy_error_on_invalid_params() {
         other => panic!("unexpected error: {other:?}"),
     }
 }
+
+#[test]
+fn cleaner_marks_unmatched_issue_as_unresolved_with_audit() {
+    let input_records = vec![make_record("10.00", "10.00")];
+    let missing_dates_issue = Issue {
+        issue_type: IssueType::MissingDates,
+        category: "DataIntegrity".to_string(),
+        rule_name: "MissingDatesRule".to_string(),
+        ticker: "000001.SZ".to_string(),
+        date: "2026-03-07|2026-03-10".to_string(),
+        field: "date".to_string(),
+        value: "gap".to_string(),
+        detail: "Trading days missing between records".to_string(),
+    };
+
+    let cleaner = DefaultCleanerStage::new(
+        RuleNamePolicyResolver,
+        NoopPolicyExecutor,
+        DefaultLoadErrorAuditMapper,
+    );
+
+    let out = cleaner
+        .run(&input_records, &[missing_dates_issue], &[], &HandlingConfig { policies: vec![] })
+        .expect("cleaning succeeds");
+
+    assert_eq!(out.processed_issues, 0);
+    assert_eq!(out.unresolved_issues, 1);
+
+    let unresolved = out
+        .audit_entries
+        .iter()
+        .find(|a| a.action == "UNRESOLVED" && a.rule_name == "MissingDatesRule")
+        .expect("must keep unmatched issue in audit");
+    assert_eq!(unresolved.ticker, "000001.SZ");
+    assert_eq!(unresolved.date, "2026-03-07|2026-03-10");
+}
+
+#[test]
+fn cleaner_mixed_matched_and_unmatched_issues_are_both_accounted_for() {
+    let input_records = vec![make_record("-1.00", "10.00")];
+    let matched_issue = make_issue();
+    let unmatched_issue = Issue {
+        issue_type: IssueType::MissingDates,
+        category: "DataIntegrity".to_string(),
+        rule_name: "MissingDatesRule".to_string(),
+        ticker: "000001.SZ".to_string(),
+        date: "2026-03-07|2026-03-10".to_string(),
+        field: "date".to_string(),
+        value: "gap".to_string(),
+        detail: "Trading days missing between records".to_string(),
+    };
+
+    let handling = HandlingConfig {
+        policies: vec![PolicyConfig {
+            rule_name: "NegativePriceRule".to_string(),
+            action: "set_literal".to_string(),
+            params: serde_yaml::from_str("value: '10.10'").expect("yaml"),
+        }],
+    };
+
+    let cleaner = DefaultCleanerStage::new(
+        RuleNamePolicyResolver,
+        BuiltinPolicyExecutor,
+        DefaultLoadErrorAuditMapper,
+    );
+
+    let out = cleaner
+        .run(
+            &input_records,
+            &[matched_issue, unmatched_issue],
+            &[],
+            &handling,
+        )
+        .expect("cleaning succeeds");
+
+    assert_eq!(out.cleaned_records[0].close, d("10.10"));
+    assert_eq!(out.processed_issues, 1);
+    assert_eq!(out.unresolved_issues, 1);
+    assert!(out
+        .audit_entries
+        .iter()
+        .any(|a| a.action == "set_literal" && a.rule_name == "NegativePriceRule"));
+    assert!(out
+        .audit_entries
+        .iter()
+        .any(|a| a.action == "UNRESOLVED" && a.rule_name == "MissingDatesRule"));
+}

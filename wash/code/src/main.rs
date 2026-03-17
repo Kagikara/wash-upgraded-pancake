@@ -319,16 +319,22 @@ fn load_tick_size(path: &Path) -> Option<Decimal> {
     let yaml = serde_yaml::from_str::<serde_yaml::Value>(&raw).ok()?;
 
     // Accept both top-level tick_size and nested market_rules.tick_size.
-    let top = yaml.get("tick_size").and_then(|v| v.as_str());
-    if let Some(v) = top {
-        return Decimal::from_str_exact(v).ok();
+    if let Some(v) = yaml.get("tick_size").and_then(parse_tick_size_value) {
+        return Some(v);
     }
 
-    let nested = yaml
+    yaml
         .get("market_rules")
         .and_then(|v| v.get("tick_size"))
-        .and_then(|v| v.as_str());
-    nested.and_then(|v| Decimal::from_str_exact(v).ok())
+        .and_then(parse_tick_size_value)
+}
+
+fn parse_tick_size_value(v: &serde_yaml::Value) -> Option<Decimal> {
+    match v {
+        serde_yaml::Value::String(s) => s.parse::<Decimal>().ok(),
+        serde_yaml::Value::Number(n) => n.to_string().parse::<Decimal>().ok(),
+        _ => None,
+    }
 }
 
 fn write_cleaned_csv(path: &Path, records: &[wash_load::Record]) -> Result<(), Box<dyn Error>> {
@@ -410,6 +416,7 @@ Options:\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_yaml::Value;
 
     #[test]
     fn parse_args_supports_review_only() {
@@ -429,5 +436,17 @@ mod tests {
     fn parse_args_requires_config() {
         let err = parse_args(vec!["cleaner".to_string()]).expect_err("missing config should fail");
         assert!(err.to_string().contains("missing arguments"));
+    }
+
+    #[test]
+    fn parse_tick_size_value_supports_string_and_number() {
+        let as_string: Value = serde_yaml::from_str("tick_size: \"0.0001\"").expect("yaml");
+        let as_number: Value = serde_yaml::from_str("tick_size: 0.0001").expect("yaml");
+
+        let v1 = parse_tick_size_value(as_string.get("tick_size").expect("tick_size key"));
+        let v2 = parse_tick_size_value(as_number.get("tick_size").expect("tick_size key"));
+
+        assert_eq!(v1.expect("parse string"), "0.0001".parse::<Decimal>().expect("decimal"));
+        assert_eq!(v2.expect("parse number"), "0.0001".parse::<Decimal>().expect("decimal"));
     }
 }

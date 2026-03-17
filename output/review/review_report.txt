@@ -1,0 +1,14 @@
+[stats]
+total_issues: 0
+ticker_count: 0
+issue_by_date:
+
+issue_by_category:
+
+issue_by_rule:
+
+[charts]
+- Issue Count By Date
+- Issue Count By Category
+- Issue Count By Rule
+[preview]

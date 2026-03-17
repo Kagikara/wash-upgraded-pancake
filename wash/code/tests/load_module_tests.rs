@@ -59,12 +59,12 @@ handling:
     assert_eq!(cfg.mode, RunMode::ReviewOnly);
     assert_eq!(cfg.input.format, InputFormat::Csv);
     assert_eq!(
-        cfg.calendar.trading_calendar_path.to_string_lossy(),
-        "data/default_trading_calendar.csv"
+      cfg.calendar.trading_calendar_path,
+      dir.path().join("data/default_trading_calendar.csv")
     );
     assert_eq!(
-        cfg.market_rules.path.to_string_lossy(),
-        "data/default_market_rules.yaml"
+      cfg.market_rules.path,
+      dir.path().join("data/default_market_rules.yaml")
     );
 
     let output = load_data(&cfg).expect("load success");
