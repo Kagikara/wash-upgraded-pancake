@@ -1458,6 +1458,10 @@ fn record_field_value(record: &Record, field: &str) -> Result<String, CleanerErr
         "low" => Ok(record.low.to_string()),
         "close" => Ok(record.close.to_string()),
         "vwap" => Ok(record.vwap.to_string()),
+        "price" => Ok(format!(
+            "open={},high={},low={},close={},vwap={}",
+            record.open, record.high, record.low, record.close, record.vwap
+        )),
         "volume" => Ok(record.volume.to_string()),
         "turnover" => Ok(record.turnover.to_string()),
         "status" => Ok(format!("{:?}", record.status)),
@@ -1496,17 +1500,11 @@ fn set_record_field(record: &mut Record, field: &str, value: &str) -> Result<(),
             Ok(())
         }
         "volume" => {
-            record.volume = value.parse::<i64>().map_err(|_| CleanerError::PolicyExecution {
-                rule_name: "PolicyParam".to_string(),
-                detail: format!("invalid int literal for volume: {value}"),
-            })?;
+            record.volume = parse_decimal_literal(value, field)?;
             Ok(())
         }
         "turnover" => {
-            record.turnover = value.parse::<i64>().map_err(|_| CleanerError::PolicyExecution {
-                rule_name: "PolicyParam".to_string(),
-                detail: format!("invalid int literal for turnover: {value}"),
-            })?;
+            record.turnover = parse_decimal_literal(value, field)?;
             Ok(())
         }
         "status" => {
@@ -1797,8 +1795,8 @@ pub struct Record {
     pub low: Decimal,
     pub close: Decimal,
     pub vwap: Decimal,
-    pub volume: i64,
-    pub turnover: i64,
+    pub volume: Decimal,
+    pub turnover: Decimal,
     pub status: TradeStatus,
 }
 
@@ -2673,13 +2671,13 @@ fn parse_csv_row(
         })
     };
 
-    let parse_i64 = |s: &str, field: &str| -> Result<i64, LoadError> {
-        s.parse::<i64>().map_err(|_| LoadError {
+    let parse_decimal_metric = |s: &str, field: &str| -> Result<Decimal, LoadError> {
+        Decimal::from_str(s).map_err(|_| LoadError {
             stage: "LOAD",
             row_number,
             raw_row: raw_row.clone(),
             error_code: LoadErrorCode::TypeCastFail,
-            error_detail: format!("invalid int for {field}: {s}"),
+            error_detail: format!("invalid decimal for {field}: {s}"),
         })
     };
 
@@ -2692,8 +2690,8 @@ fn parse_csv_row(
     let close = parse_decimal(get(&schema.close)?, "close")?;
     let vwap = parse_decimal(get(&schema.vwap)?, "vwap")?;
 
-    let volume = parse_i64(get(&schema.volume)?, "volume")?;
-    let turnover = parse_i64(get(&schema.turnover)?, "turnover")?;
+    let volume = parse_decimal_metric(get(&schema.volume)?, "volume")?;
+    let turnover = parse_decimal_metric(get(&schema.turnover)?, "turnover")?;
     let status = TradeStatus::parse(get(&schema.status)?);
 
     Ok(Record {

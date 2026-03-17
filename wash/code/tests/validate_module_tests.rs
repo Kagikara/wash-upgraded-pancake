@@ -18,7 +18,7 @@ fn make_record(
     low: &str,
     close: &str,
     vwap: &str,
-    volume: i64,
+    volume: Decimal,
 ) -> Record {
     Record {
         date: date.to_string(),
@@ -29,7 +29,7 @@ fn make_record(
         close: d(close),
         vwap: d(vwap),
         volume,
-        turnover: 1,
+        turnover: d("1"),
         status: TradeStatus::Normal,
     }
 }
@@ -48,11 +48,11 @@ fn base_plan() -> ValidationPlan {
 #[test]
 fn validate_records_success_and_find_multiple_issues() {
     let records = vec![
-        make_record("2026-03-03", "000001.SZ", "10.00", "10.20", "9.80", "10.10", "10.00", 100),
-        make_record("2026-03-03", "000001.SZ", "10.05", "10.25", "9.85", "10.15", "10.10", 100),
-        make_record("2026-03-06", "000001.SZ", "10.00", "9.00", "9.50", "9.80", "12.00", 100),
-        make_record("2026-03-08", "000001.SZ", "10.00", "10.20", "9.90", "10.10", "10.05", 100),
-        make_record("2026-03-07", "000002.SZ", "-1.00", "1.00", "0.50", "0.80", "0.70", 10),
+        make_record("2026-03-03", "000001.SZ", "10.00", "10.20", "9.80", "10.10", "10.00", d("100")),
+        make_record("2026-03-03", "000001.SZ", "10.05", "10.25", "9.85", "10.15", "10.10", d("100")),
+        make_record("2026-03-06", "000001.SZ", "10.00", "9.00", "9.50", "9.80", "12.00", d("100")),
+        make_record("2026-03-08", "000001.SZ", "10.00", "10.20", "9.90", "10.10", "10.05", d("100")),
+        make_record("2026-03-07", "000002.SZ", "-1.00", "1.00", "0.50", "0.80", "0.70", d("10")),
     ];
 
     let ctx = ValidationContext::new(
@@ -99,8 +99,8 @@ fn validate_records_success_and_find_multiple_issues() {
 #[test]
 fn enabled_rules_and_disabled_rules_filter_correctly() {
     let records = vec![
-        make_record("2026-03-03", "000001.SZ", "10.00", "10.20", "9.80", "10.10", "10.00", 100),
-        make_record("2026-03-03", "000001.SZ", "10.05", "10.25", "9.85", "10.15", "10.10", 100),
+        make_record("2026-03-03", "000001.SZ", "10.00", "10.20", "9.80", "10.10", "10.00", d("100")),
+        make_record("2026-03-03", "000001.SZ", "10.05", "10.25", "9.85", "10.15", "10.10", d("100")),
     ];
     let ctx = ValidationContext::new(vec!["2026-03-03".to_string()], d("0.01"));
 
@@ -143,7 +143,7 @@ fn unknown_category_returns_error() {
         "9.80",
         "10.10",
         "10.00",
-        100,
+        d("100"),
     )];
     let ctx = ValidationContext::new(vec!["2026-03-03".to_string()], d("0.01"));
 
@@ -175,7 +175,7 @@ fn unknown_rule_returns_error() {
         "9.80",
         "10.10",
         "10.00",
-        100,
+        d("100"),
     )];
     let ctx = ValidationContext::new(vec!["2026-03-03".to_string()], d("0.01"));
 

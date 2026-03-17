@@ -17,6 +17,63 @@
 cleaner --config config.yaml --review-only
 ```
 
+更多常用调用方式：
+
+```bash
+# 只做审查，不清洗
+cleaner --config config.yaml --review-only
+
+# 运行清洗（按 config.yaml 的 mode，也可 --mode 覆盖）
+cleaner --config config.yaml --mode clean
+
+# 全流程 + 版本快照（默认 full 模式会写入 .history）
+cleaner --config config.yaml --mode full --author "quant-user" --message "daily wash"
+
+# 自定义输出目录
+cleaner --config config.yaml --review-output-dir output/review --output-dir output/final
+```
+
+可用参数：
+
+- `--config <path>`：YAML 配置文件（必填）
+- `--mode <review-only|clean|full>`：覆盖 YAML 中 `mode`
+- `--review-only`：等价于 `--mode review-only`
+- `--review-output-dir <path>`：审查阶段输出目录（默认 `output/review`）
+- `--output-dir <path>`：清洗/审计输出目录（默认 `output/final`）
+- `--no-versioning`：在 `full` 模式下跳过 `.history` 快照
+- `--author <name>`：版本快照作者名（默认 `cli-user`）
+- `--message <text>`：版本快照 message
+
+---
+
+## CLI 交互需要准备的文件
+
+必需文件：
+
+- `config.yaml`：主配置文件（mode/input/rules/handling）
+- `input.path` 对应的数据文件：当前实现需为 CSV（`input.format: csv`）
+
+强烈建议准备（用于更真实审查结果）：
+
+- `calendar.trading_calendar_path`：交易日历 CSV（用于缺失交易日/非交易日判断）
+- `market_rules.path`：市场规则 YAML（当前会尝试读取 `tick_size`）
+
+可选文件：
+
+- `output/review/disabled_issues.yaml`：人工核验后禁用问题规则（Review Stage 会自动读取）
+   - 不存在时默认“不禁用任何问题”
+- `corporate_actions.path`：公司行为映射（预留扩展）
+- `lifecycle_map.path`：生命周期映射（预留扩展）
+
+运行后会生成的关键输出文件：
+
+- `output/review/review_report.txt`
+- `output/final/cleaned.csv`
+- `output/final/audit_log.json`
+- `output/final/audit_log.csv`
+- `output/final/summary.json`
+- `.history/HEAD` 与 `.history/commits/*`（仅 full 且未 `--no-versioning`）
+
 ---
 
 ## 1. 配置加载（CLI Config）

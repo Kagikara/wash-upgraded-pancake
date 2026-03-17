@@ -47,11 +47,8 @@ fn parse_decimal(raw: &str, field: &str) -> Decimal {
         .unwrap_or_else(|_| panic!("invalid decimal in {field}: {raw}"))
 }
 
-fn parse_decimal_like_int(raw: &str, field: &str) -> i64 {
-    let integer_part = raw.split('.').next().unwrap_or(raw);
-    integer_part
-        .parse::<i64>()
-        .unwrap_or_else(|_| panic!("invalid decimal-like int in {field}: {raw}"))
+fn parse_decimal_metric(raw: &str, field: &str) -> Decimal {
+    parse_decimal(raw, field)
 }
 
 fn load_zz500_records_for_validation() -> Vec<Record> {
@@ -77,8 +74,8 @@ fn load_zz500_records_for_validation() -> Vec<Record> {
             close,
             // zz500 raw file has no VWAP/status columns; for calendar-only checks, reuse close and NORMAL.
             vwap: parse_decimal(rec.get(2).expect("close"), "close"),
-            volume: parse_decimal_like_int(rec.get(9).expect("vol"), "vol"),
-            turnover: parse_decimal_like_int(rec.get(10).expect("amount"), "amount"),
+            volume: parse_decimal_metric(rec.get(9).expect("vol"), "vol"),
+            turnover: parse_decimal_metric(rec.get(10).expect("amount"), "amount"),
             status: TradeStatus::Normal,
         });
     }
@@ -157,7 +154,7 @@ handling:
 }
 
 #[test]
-fn zz500_numeric_contract_rejects_decimal_text_for_int_fields() {
+fn zz500_numeric_contract_accepts_decimal_text_for_metrics() {
     let dir = tempdir().expect("tmp dir");
     let cfg_path = dir.path().join("zz500_numeric_contract.yaml");
     let csv_path = zz500_csv_path();
@@ -192,16 +189,8 @@ handling:
     let cfg = load_and_validate_config(&cfg_path, &registry()).expect("config should be valid");
     let output = load_data(&cfg).expect("loader should complete and collect row errors");
 
-    assert_eq!(output.records.len(), 0);
-    assert_eq!(output.load_errors.len(), 48);
-    assert!(output
-        .load_errors
-        .iter()
-        .all(|e| e.error_code == LoadErrorCode::TypeCastFail));
-    assert!(output
-        .load_errors
-        .iter()
-        .all(|e| e.error_detail.contains("invalid int for volume")));
+    assert_eq!(output.records.len(), 48);
+    assert_eq!(output.load_errors.len(), 0);
 }
 
 #[test]

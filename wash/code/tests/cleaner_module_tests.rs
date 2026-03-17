@@ -18,8 +18,8 @@ fn make_record(close: &str, vwap: &str) -> Record {
         low: d("9.80"),
         close: d(close),
         vwap: d(vwap),
-        volume: 100,
-        turnover: 1000,
+        volume: d("100"),
+        turnover: d("1000"),
         status: TradeStatus::Normal,
     }
 }

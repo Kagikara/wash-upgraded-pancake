@@ -1,0 +1,10 @@
+{
+  "total_rows": 48,
+  "total_issues": 48,
+  "processed_issues": 0,
+  "unresolved_issues": 48,
+  "disabled_issues": 0,
+  "load_error_count": 0,
+  "total_time_ms": 13,
+  "throughput_rows_per_sec": 3692
+}
