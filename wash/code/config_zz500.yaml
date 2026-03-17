@@ -17,6 +17,9 @@ input:
 calendar:
   trading_calendar_path: "../../data/trading_date_SSE_20050101-20251231.csv"
 
+market_rules:
+  path: "../../data/market_rules_zz500.yaml"
+
 rules:
   enabled_categories: ["DataIntegrity", "IntraBarLogic"]
   enabled_rules: []
