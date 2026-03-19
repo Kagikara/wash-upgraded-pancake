@@ -68,6 +68,7 @@ handling:
     );
 
     let output = load_data(&cfg).expect("load success");
+    assert_eq!(output.total_rows, 1);
     assert_eq!(output.records.len(), 1);
     assert_eq!(output.load_errors.len(), 0);
 
@@ -255,6 +256,7 @@ handling:
     let cfg = load_and_validate_config(&cfg_path, &registry()).expect("config ok");
     let output = load_data(&cfg).expect("load should finish");
 
+    assert_eq!(output.total_rows, 2);
     assert_eq!(output.records.len(), 1);
     assert_eq!(output.load_errors.len(), 1);
     assert_eq!(output.load_errors[0].error_code, LoadErrorCode::TypeCastFail);

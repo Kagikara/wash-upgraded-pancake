@@ -1841,6 +1841,7 @@ pub struct LoadError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadOutput {
+    pub total_rows: usize,
     pub records: Vec<Record>,
     pub load_errors: Vec<LoadError>,
 }
@@ -2646,8 +2647,10 @@ fn load_csv_data(cfg: &LoadConfig) -> Result<LoadOutput, LoadStageError> {
 
     let mut records = Vec::new();
     let mut load_errors = Vec::new();
+    let mut total_rows = 0usize;
 
     for (idx, row) in reader.records().enumerate() {
+        total_rows += 1;
         let row_number = idx + 1;
         match row {
             Ok(rec) => match parse_csv_row(&rec, &header_index, &cfg.input.schema, row_number) {
@@ -2665,6 +2668,7 @@ fn load_csv_data(cfg: &LoadConfig) -> Result<LoadOutput, LoadStageError> {
     }
 
     Ok(LoadOutput {
+        total_rows,
         records,
         load_errors,
     })

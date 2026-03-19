@@ -298,7 +298,7 @@ fn user_journey_review_then_full_pipeline_with_isolated_outputs() {
         .publish(
             &cleaner_out.audit_entries,
             wash_load::PerformanceSummaryInput {
-                total_rows: load_out.records.len(),
+                total_rows: load_out.total_rows,
                 total_issues: validation_out.total_issues,
                 disabled_issues: review_out.disabled_issues.len(),
                 load_error_count: load_out.load_errors.len(),

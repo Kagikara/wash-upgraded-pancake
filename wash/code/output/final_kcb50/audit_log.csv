@@ -1,0 +1,2 @@
+timestamp,stage,ticker,date,issue_type,category,rule_name,field,old_value,new_value,action,action_source,comment
+1773926727419,LOAD,,,LOAD_ERROR,Loader,Loader::parse_csv_row,raw_row,"000688.SH,20191231,1000.0,,,,,,,1516205.33,6818057.448","000688.SH,20191231,1000.0,,,,,,,1516205.33,6818057.448",LOAD_ERROR,LOADER,"row=1019, code=TypeCastFail, detail=invalid decimal for open: "

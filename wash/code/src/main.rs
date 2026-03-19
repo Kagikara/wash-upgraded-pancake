@@ -45,6 +45,13 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let started_at = Instant::now();
     let load_out = load_data(&cfg)?;
+    if !load_out.load_errors.is_empty() {
+        println!(
+            "load complete with errors: parsed_rows={}, load_errors={}",
+            load_out.records.len(),
+            load_out.load_errors.len()
+        );
+    }
 
     let validation_plan = ValidationPlan::from_rule_switch(&cfg.rules);
     let validation_ctx = build_validation_ctx(&cfg.calendar.trading_calendar_path, &cfg.market_rules.path)?;
@@ -126,7 +133,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let perf = audit_service.publish(
         &cleaner_out.audit_entries,
         wash_load::PerformanceSummaryInput {
-            total_rows: load_out.records.len(),
+            total_rows: load_out.total_rows,
             total_issues: validation_out.total_issues,
             disabled_issues: review_out.disabled_issues.len(),
             load_error_count: load_out.load_errors.len(),

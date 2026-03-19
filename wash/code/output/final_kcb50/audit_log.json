@@ -1,0 +1,16 @@
+{
+  "audit_entries": [
+    {"timestamp":"1773926727419","stage":"LOAD","ticker":"","date":"","issue_type":"LOAD_ERROR","category":"Loader","rule_name":"Loader::parse_csv_row","field":"raw_row","old_value":"000688.SH,20191231,1000.0,,,,,,,1516205.33,6818057.448","new_value":"000688.SH,20191231,1000.0,,,,,,,1516205.33,6818057.448","action":"LOAD_ERROR","action_source":"LOADER","comment":"row=1019, code=TypeCastFail, detail=invalid decimal for open: "}
+  ],
+  "performance": {
+    "total_rows": 1019,
+    "load_error_count": 1,
+    "total_issues": 0,
+    "processed_issues": 0,
+    "unresolved_issues": 0,
+    "disabled_issues": 0,
+    "total_time_ms": 160,
+    "throughput_rows_per_sec": 6368,
+    "rule_time_breakdown": {"DuplicateDatesRule":1,"HighLowLogicRule":0,"MissingDatesRule":131,"NegativePriceRule":0,"NonTradingDayRule":0,"TickSizeRule":0,"VwapRangeRule":0}
+  }
+}

@@ -322,7 +322,7 @@ fn full_pipeline_happy_path_with_mocked_llm_and_versioning_snapshot() {
         .publish(
             &cleaner_out.audit_entries,
             wash_load::PerformanceSummaryInput {
-                total_rows: load_out.records.len(),
+                total_rows: load_out.total_rows,
                 total_issues: validation_out.total_issues,
                 disabled_issues: review_out.disabled_issues.len(),
                 load_error_count: load_out.load_errors.len(),
