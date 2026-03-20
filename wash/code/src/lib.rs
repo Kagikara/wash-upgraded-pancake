@@ -1162,6 +1162,127 @@ pub enum CleanerError {
     UnknownField(String),
     #[error("policy execution failed for {rule_name}: {detail}")]
     PolicyExecution { rule_name: String, detail: String },
+    #[error(
+        "invariant violation ({rule_name}): {detail}; original_row={original_row}; cleaned_row={cleaned_row}"
+    )]
+    InvariantViolation {
+        rule_name: String,
+        detail: String,
+        original_row: String,
+        cleaned_row: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ValidationModule;
+
+impl ValidationModule {
+    pub fn validate_row(original: &Record, cleaned: &Record) -> Result<(), CleanerError> {
+        let zero = Decimal::ZERO;
+
+        Self::ensure(
+            cleaned.high >= cleaned.open,
+            "PriceInvariant::HighGteOpen",
+            "high must be >= open",
+            original,
+            cleaned,
+        )?;
+        Self::ensure(
+            cleaned.high >= cleaned.close,
+            "PriceInvariant::HighGteClose",
+            "high must be >= close",
+            original,
+            cleaned,
+        )?;
+        Self::ensure(
+            cleaned.high >= cleaned.low,
+            "PriceInvariant::HighGteLow",
+            "high must be >= low",
+            original,
+            cleaned,
+        )?;
+        Self::ensure(
+            cleaned.low <= cleaned.open,
+            "PriceInvariant::LowLteOpen",
+            "low must be <= open",
+            original,
+            cleaned,
+        )?;
+        Self::ensure(
+            cleaned.low <= cleaned.close,
+            "PriceInvariant::LowLteClose",
+            "low must be <= close",
+            original,
+            cleaned,
+        )?;
+
+        Self::ensure(
+            cleaned.volume >= zero,
+            "NonNegative::Volume",
+            "volume must be >= 0",
+            original,
+            cleaned,
+        )?;
+        Self::ensure(
+            cleaned.turnover >= zero,
+            "NonNegative::Amount",
+            "amount(turnover) must be >= 0",
+            original,
+            cleaned,
+        )?;
+        Self::ensure(
+            cleaned.open > zero,
+            "Positive::Open",
+            "open must be > 0",
+            original,
+            cleaned,
+        )?;
+
+        Self::ensure(
+            !(cleaned.turnover > zero && cleaned.volume <= zero),
+            "VolumeAmount::AmountImpliesVolume",
+            "volume must be > 0 when amount(turnover) > 0",
+            original,
+            cleaned,
+        )?;
+
+        Ok(())
+    }
+
+    fn ensure(
+        condition: bool,
+        rule_name: &str,
+        detail: &str,
+        original: &Record,
+        cleaned: &Record,
+    ) -> Result<(), CleanerError> {
+        if condition {
+            return Ok(());
+        }
+
+        Err(CleanerError::InvariantViolation {
+            rule_name: rule_name.to_string(),
+            detail: detail.to_string(),
+            original_row: Self::render_row(original),
+            cleaned_row: Self::render_row(cleaned),
+        })
+    }
+
+    fn render_row(record: &Record) -> String {
+        format!(
+            "date={},ticker={},open={},high={},low={},close={},vwap={},volume={},turnover={},status={:?}",
+            record.date,
+            record.ticker,
+            record.open,
+            record.high,
+            record.low,
+            record.close,
+            record.vwap,
+            record.volume,
+            record.turnover,
+            record.status,
+        )
+    }
 }
 
 pub trait PolicyResolver: Send + Sync {
@@ -1256,41 +1377,41 @@ where
         let mut processed_issues = 0usize;
         let mut unresolved_issues = 0usize;
 
-        for record in &mut cleaned_records {
+        for (idx, record) in cleaned_records.iter_mut().enumerate() {
             let key = (record.ticker.clone(), record.date.clone());
-            let Some(issues) = issue_index.get(&key) else {
-                continue;
-            };
+            if let Some(issues) = issue_index.get(&key) {
+                for issue in issues {
+                    let old_value = record_field_value(record, &issue.field)?;
 
-            for issue in issues {
-                let old_value = record_field_value(record, &issue.field)?;
+                    let Some(policy) = self.resolver.resolve_policy(issue, handling) else {
+                        // Missing policy is tracked as unresolved instead of failing
+                        // hard, so the pipeline can still produce auditable output.
+                        unresolved_issues += 1;
+                        audit_entries.push(new_audit_entry(
+                            issue,
+                            old_value.clone(),
+                            old_value,
+                            "UNRESOLVED".to_string(),
+                            AuditActionSource::Disabled,
+                            "No policy configured for this issue".to_string(),
+                        ));
+                        continue;
+                    };
 
-                let Some(policy) = self.resolver.resolve_policy(issue, handling) else {
-                    // Missing policy is tracked as unresolved instead of failing
-                    // hard, so the pipeline can still produce auditable output.
-                    unresolved_issues += 1;
+                    let applied = self.executor.apply_policy(record, issue, &policy)?;
+                    processed_issues += 1;
                     audit_entries.push(new_audit_entry(
                         issue,
-                        old_value.clone(),
-                        old_value,
-                        "UNRESOLVED".to_string(),
-                        AuditActionSource::Disabled,
-                        "No policy configured for this issue".to_string(),
+                        applied.old_value,
+                        applied.new_value,
+                        applied.action,
+                        applied.action_source,
+                        applied.comment,
                     ));
-                    continue;
-                };
-
-                let applied = self.executor.apply_policy(record, issue, &policy)?;
-                processed_issues += 1;
-                audit_entries.push(new_audit_entry(
-                    issue,
-                    applied.old_value,
-                    applied.new_value,
-                    applied.action,
-                    applied.action_source,
-                    applied.comment,
-                ));
+                }
             }
+
+            ValidationModule::validate_row(&records[idx], record)?;
         }
 
         // Some issues (for example MissingDatesRule) may reference synthetic

@@ -84,8 +84,17 @@ fn cleaner_clones_records_and_merges_load_errors_into_audit() {
 
 #[test]
 fn cleaner_marks_issue_unresolved_when_policy_missing() {
-    let input_records = vec![make_record("-1.00", "10.00")];
-    let issue = make_issue();
+    let input_records = vec![make_record("10.00", "10.00")];
+    let issue = Issue {
+        issue_type: IssueType::NegativePrice,
+        category: "IntraBarLogic".to_string(),
+        rule_name: "MissingPolicyRule".to_string(),
+        ticker: "000001.SZ".to_string(),
+        date: "2026-03-06".to_string(),
+        field: "close".to_string(),
+        value: "-1.00".to_string(),
+        detail: "Issue is intentionally left unresolved".to_string(),
+    };
 
     let handling = HandlingConfig { policies: vec![] };
     let cleaner = DefaultCleanerStage::new(
@@ -100,7 +109,7 @@ fn cleaner_marks_issue_unresolved_when_policy_missing() {
 
     assert_eq!(out.processed_issues, 0);
     assert_eq!(out.unresolved_issues, 1);
-    assert_eq!(out.cleaned_records[0].close, d("-1.00"));
+    assert_eq!(out.cleaned_records[0].close, d("10.00"));
 
     let unresolved = out
         .audit_entries
@@ -329,4 +338,81 @@ fn cleaner_mixed_matched_and_unmatched_issues_are_both_accounted_for() {
         .audit_entries
         .iter()
         .any(|a| a.action == "UNRESOLVED" && a.rule_name == "MissingDatesRule"));
+}
+
+#[test]
+fn cleaner_fails_fast_when_cleaned_row_breaks_open_positive_invariant() {
+    let input_records = vec![make_record("10.00", "10.00")];
+    let issue = Issue {
+        issue_type: IssueType::NegativePrice,
+        category: "IntraBarLogic".to_string(),
+        rule_name: "ForceOpenZeroRule".to_string(),
+        ticker: "000001.SZ".to_string(),
+        date: "2026-03-06".to_string(),
+        field: "open".to_string(),
+        value: "10.00".to_string(),
+        detail: "force open to zero for test".to_string(),
+    };
+
+    let handling = HandlingConfig {
+        policies: vec![PolicyConfig {
+            rule_name: "ForceOpenZeroRule".to_string(),
+            action: "set_literal".to_string(),
+            params: serde_yaml::from_str("value: '0'").expect("yaml"),
+        }],
+    };
+
+    let cleaner = DefaultCleanerStage::new(
+        RuleNamePolicyResolver,
+        BuiltinPolicyExecutor,
+        DefaultLoadErrorAuditMapper,
+    );
+
+    let err = cleaner
+        .run(&input_records, &[issue], &[], &handling)
+        .expect_err("should fail on invariant violation");
+
+    match err {
+        CleanerError::InvariantViolation {
+            rule_name,
+            detail,
+            original_row,
+            cleaned_row,
+        } => {
+            assert_eq!(rule_name, "PriceInvariant::LowLteOpen");
+            assert!(detail.contains("low must be <= open"));
+            assert!(original_row.contains("open=10.00"));
+            assert!(cleaned_row.contains("open=0"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn cleaner_fails_on_amount_positive_but_volume_non_positive() {
+    let mut bad_record = make_record("10.00", "10.00");
+    bad_record.volume = d("0");
+    bad_record.turnover = d("1000");
+
+    let cleaner = DefaultCleanerStage::new(
+        RuleNamePolicyResolver,
+        BuiltinPolicyExecutor,
+        DefaultLoadErrorAuditMapper,
+    );
+
+    let err = cleaner
+        .run(&[bad_record], &[], &[], &HandlingConfig { policies: vec![] })
+        .expect_err("should fail on amount-volume invariant");
+
+    match err {
+        CleanerError::InvariantViolation {
+            rule_name,
+            detail,
+            ..
+        } => {
+            assert_eq!(rule_name, "VolumeAmount::AmountImpliesVolume");
+            assert!(detail.contains("volume must be > 0 when amount(turnover) > 0"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
