@@ -1,0 +1,41 @@
+mode: clean
+
+input:
+  path: ../../data/sh50_data.csv
+  format: csv
+  schema:
+    date: trade_date
+    ticker: ts_code
+    open: open
+    high: high
+    low: low
+    close: close
+    vwap: close
+    volume: vol
+    turnover: amount
+    status: status
+
+calendar:
+  trading_calendar_path: ../../data/trading_date_SSE_20050101-20251231.csv
+
+market_rules:
+  path: ../../data/market_rules_zz500.yaml
+
+rules:
+  enabled_categories:
+    - DataIntegrity
+    - IntraBarLogic
+  enabled_rules: []
+  disabled_rules: []
+
+handling:
+  policies:
+    - rule_name: VwapRangeRule
+      action: clamp_field
+      params:
+        min_field: low
+        max_field: high
+    - rule_name: HighLowLogicRule
+      action: set_literal
+      params:
+        value: "0"

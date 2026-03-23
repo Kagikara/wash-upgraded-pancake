@@ -1,10 +1,10 @@
 {
-  "total_rows": 48,
-  "total_issues": 48,
+  "total_rows": 3146,
+  "total_issues": 0,
   "processed_issues": 0,
-  "unresolved_issues": 48,
+  "unresolved_issues": 0,
   "disabled_issues": 0,
   "load_error_count": 0,
-  "total_time_ms": 13,
-  "throughput_rows_per_sec": 3692
+  "total_time_ms": 418,
+  "throughput_rows_per_sec": 7526
 }

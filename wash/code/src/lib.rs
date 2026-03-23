@@ -2853,7 +2853,15 @@ fn parse_csv_row(
 
     let volume = parse_decimal_metric(get(&schema.volume)?, "volume")?;
     let turnover = parse_decimal_metric(get(&schema.turnover)?, "turnover")?;
-    let status = TradeStatus::parse(get(&schema.status)?);
+    // Some vendor datasets do not provide an explicit status column.
+    // Treat missing/blank status as NORMAL to keep loading resilient.
+    let status = header_index
+        .get(&schema.status)
+        .and_then(|idx| row.get(*idx))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(TradeStatus::parse)
+        .unwrap_or(TradeStatus::Normal);
 
     Ok(Record {
         date,

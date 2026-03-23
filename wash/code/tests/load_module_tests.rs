@@ -303,3 +303,95 @@ handling:
         other => panic!("unexpected error: {other:?}"),
     }
 }
+
+#[test]
+fn missing_status_column_defaults_to_normal() {
+    let dir = tempdir().expect("tmp dir");
+    let csv_path = dir.path().join("raw.csv");
+    write_file(
+        &csv_path,
+        "date,ticker,open,high,low,close,vwap,volume,turnover\n2026-03-06,000001.SZ,10.1,10.5,9.9,10.2,10.15,1000,10000\n",
+    );
+
+    let cfg_path = dir.path().join("config.yaml");
+    let cfg_text = format!(
+        "mode: review-only
+input:
+  path: \"{}\"
+  format: csv
+  schema:
+    date: date
+    ticker: ticker
+    open: open
+    high: high
+    low: low
+    close: close
+    vwap: vwap
+    volume: volume
+    turnover: turnover
+    status: status
+rules:
+  enabled_categories: [\"DataIntegrity\"]
+  enabled_rules: []
+  disabled_rules: []
+handling:
+  policies: []
+",
+        csv_path.display()
+    );
+    write_file(&cfg_path, &cfg_text);
+
+    let cfg = load_and_validate_config(&cfg_path, &registry()).expect("config ok");
+    let output = load_data(&cfg).expect("load should finish");
+
+    assert_eq!(output.total_rows, 1);
+    assert_eq!(output.records.len(), 1);
+    assert_eq!(output.load_errors.len(), 0);
+    assert_eq!(output.records[0].status, TradeStatus::Normal);
+}
+
+#[test]
+fn blank_status_value_defaults_to_normal() {
+    let dir = tempdir().expect("tmp dir");
+    let csv_path = dir.path().join("raw.csv");
+    write_file(
+        &csv_path,
+        "date,ticker,open,high,low,close,vwap,volume,turnover,status\n2026-03-06,000001.SZ,10.1,10.5,9.9,10.2,10.15,1000,10000,\n",
+    );
+
+    let cfg_path = dir.path().join("config.yaml");
+    let cfg_text = format!(
+        "mode: review-only
+input:
+  path: \"{}\"
+  format: csv
+  schema:
+    date: date
+    ticker: ticker
+    open: open
+    high: high
+    low: low
+    close: close
+    vwap: vwap
+    volume: volume
+    turnover: turnover
+    status: status
+rules:
+  enabled_categories: [\"DataIntegrity\"]
+  enabled_rules: []
+  disabled_rules: []
+handling:
+  policies: []
+",
+        csv_path.display()
+    );
+    write_file(&cfg_path, &cfg_text);
+
+    let cfg = load_and_validate_config(&cfg_path, &registry()).expect("config ok");
+    let output = load_data(&cfg).expect("load should finish");
+
+    assert_eq!(output.total_rows, 1);
+    assert_eq!(output.records.len(), 1);
+    assert_eq!(output.load_errors.len(), 0);
+    assert_eq!(output.records[0].status, TradeStatus::Normal);
+}
