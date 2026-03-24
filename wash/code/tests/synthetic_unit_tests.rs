@@ -49,9 +49,12 @@ fn synthetic_load_config(csv_name: &str) -> LoadConfig {
         corporate_actions: None,
         lifecycle_map: None,
         rules: RuleSwitchConfig {
+            version: 1,
             enabled_categories: vec!["DataIntegrity".to_string(), "IntraBarLogic".to_string()],
             enabled_rules: vec![],
             disabled_rules: vec![],
+            params: std::collections::HashMap::new(),
+            thresholds: std::collections::HashMap::new(),
         },
         handling: HandlingConfig { policies: vec![] },
     }
@@ -65,6 +68,8 @@ fn default_plan() -> ValidationPlan {
             .collect::<HashSet<_>>(),
         enabled_rules: HashSet::new(),
         disabled_rules: HashSet::new(),
+        params: std::collections::HashMap::new(),
+        thresholds: std::collections::HashMap::new(),
     }
 }
 

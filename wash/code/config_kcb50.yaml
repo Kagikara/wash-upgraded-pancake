@@ -21,6 +21,7 @@ market_rules:
   path: "../../data/market_rules_zz500.yaml"
 
 rules:
+  version: 1
   enabled_categories: ["DataIntegrity", "IntraBarLogic"]
   enabled_rules: []
   disabled_rules: []
@@ -28,11 +29,11 @@ rules:
 handling:
   policies:
     - rule_name: VwapRangeRule
-      action: clamp_field
-      params:
+      action:
+        type: clamp_field
         min_field: low
         max_field: high
     - rule_name: HighLowLogicRule
-      action: set_literal
-      params:
+      action:
+        type: set_literal
         value: "0"

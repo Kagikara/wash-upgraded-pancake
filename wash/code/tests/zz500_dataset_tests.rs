@@ -211,6 +211,8 @@ fn zz500_calendar_checks_have_no_non_trading_or_missing_day_issues() {
             .map(str::to_string)
             .collect(),
         disabled_rules: std::collections::HashSet::new(),
+        params: std::collections::HashMap::new(),
+        thresholds: std::collections::HashMap::new(),
     };
 
     let out = validate_records(&records, &ctx, &plan, &ValidationRegistry::default())

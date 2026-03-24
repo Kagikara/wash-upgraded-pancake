@@ -58,6 +58,8 @@ handling:
     let cfg = load_and_validate_config(&cfg_path, &registry()).expect("valid config");
     assert_eq!(cfg.mode, RunMode::ReviewOnly);
     assert_eq!(cfg.input.format, InputFormat::Csv);
+    assert_eq!(cfg.rules.version, 1);
+    assert!(cfg.rules.params.is_empty());
     assert_eq!(
       cfg.calendar.trading_calendar_path,
       dir.path().join("data/default_trading_calendar.csv")
@@ -176,6 +178,281 @@ handling:
         ConfigError::UnknownPolicyRule(v) => assert_eq!(v, "NoSuchRule"),
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn tagged_policy_action_parses_into_strong_type() {
+    let dir = tempdir().expect("tmp dir");
+    let cfg_path = dir.path().join("tagged_policy.yaml");
+    write_file(
+        &cfg_path,
+        "mode: review-only
+input:
+  path: data/raw.csv
+  format: csv
+  schema:
+    date: date
+    ticker: ticker
+    open: open
+    high: high
+    low: low
+    close: close
+    vwap: vwap
+    volume: volume
+    turnover: turnover
+    status: status
+rules:
+  enabled_categories: [\"IntraBarLogic\"]
+  enabled_rules: []
+  disabled_rules: []
+handling:
+  policies:
+    - rule_name: PriceBounds
+      action:
+        type: clamp_field
+        min_field: low
+        max_field: high
+",
+    );
+
+    let cfg = load_and_validate_config(&cfg_path, &registry()).expect("valid config");
+    assert_eq!(cfg.handling.policies.len(), 1);
+}
+
+#[test]
+fn unsupported_policy_action_fails_at_load_time() {
+    let dir = tempdir().expect("tmp dir");
+    let cfg_path = dir.path().join("bad_action.yaml");
+    write_file(
+        &cfg_path,
+        "mode: review-only
+input:
+  path: data/raw.csv
+  format: csv
+  schema:
+    date: date
+    ticker: ticker
+    open: open
+    high: high
+    low: low
+    close: close
+    vwap: vwap
+    volume: volume
+    turnover: turnover
+    status: status
+rules:
+  enabled_categories: [\"DataIntegrity\"]
+  enabled_rules: []
+  disabled_rules: []
+handling:
+  policies:
+    - rule_name: PriceBounds
+      action: unsupported_action
+      params: {}
+",
+    );
+
+    let err = load_and_validate_config(&cfg_path, &registry()).expect_err("must fail");
+    match err {
+        ConfigError::Schema(v) => assert!(v.contains("unsupported policy action")),
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_threshold_key_fails_at_load_time() {
+    let dir = tempdir().expect("tmp dir");
+    let cfg_path = dir.path().join("bad_threshold_key.yaml");
+    write_file(
+        &cfg_path,
+        "mode: review-only
+input:
+  path: data/raw.csv
+  format: csv
+  schema:
+    date: date
+    ticker: ticker
+    open: open
+    high: high
+    low: low
+    close: close
+    vwap: vwap
+    volume: volume
+    turnover: turnover
+    status: status
+rules:
+  enabled_categories: [\"IntraBarLogic\"]
+  enabled_rules: []
+  disabled_rules: []
+  thresholds:
+    HighLowLogicRule:
+      unknown_key: 0.1
+handling:
+  policies: []
+",
+    );
+
+    let threshold_registry = StaticRuleRegistry::new(
+        vec!["HighLowLogicRule", "NegativePriceRule", "TickSizeRule", "VwapRangeRule"],
+        vec!["IntraBarLogic"],
+    );
+    let err = load_and_validate_config(&cfg_path, &threshold_registry).expect_err("must fail");
+    match err {
+        ConfigError::Schema(v) => assert!(v.contains("unknown threshold key")),
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn thresholds_parse_from_yaml_string_or_number() {
+    let dir = tempdir().expect("tmp dir");
+    let cfg_path = dir.path().join("thresholds.yaml");
+    write_file(
+        &cfg_path,
+        "mode: review-only
+input:
+  path: data/raw.csv
+  format: csv
+  schema:
+    date: date
+    ticker: ticker
+    open: open
+    high: high
+    low: low
+    close: close
+    vwap: vwap
+    volume: volume
+    turnover: turnover
+    status: status
+rules:
+  enabled_categories: [\"IntraBarLogic\"]
+  enabled_rules: []
+  disabled_rules: []
+  thresholds:
+    HighLowLogicRule:
+      epsilon: 0.02
+handling:
+  policies: []
+",
+    );
+
+    let threshold_registry = StaticRuleRegistry::new(
+        vec!["HighLowLogicRule", "NegativePriceRule", "TickSizeRule", "VwapRangeRule"],
+        vec!["IntraBarLogic"],
+    );
+    let cfg = load_and_validate_config(&cfg_path, &threshold_registry).expect("config should parse");
+    let epsilon = cfg
+        .rules
+        .thresholds
+        .get("HighLowLogicRule")
+        .and_then(|m| m.get("epsilon"))
+        .expect("epsilon configured");
+
+    assert_eq!(*epsilon, "0.02".parse().expect("decimal"));
+}
+
+#[test]
+fn unsupported_rules_version_fails_at_load_time() {
+    let dir = tempdir().expect("tmp dir");
+    let cfg_path = dir.path().join("bad_rules_version.yaml");
+    write_file(
+        &cfg_path,
+        "mode: review-only
+input:
+  path: data/raw.csv
+  format: csv
+  schema:
+    date: date
+    ticker: ticker
+    open: open
+    high: high
+    low: low
+    close: close
+    vwap: vwap
+    volume: volume
+    turnover: turnover
+    status: status
+rules:
+  version: 99
+  enabled_categories: [\"IntraBarLogic\"]
+  enabled_rules: []
+  disabled_rules: []
+handling:
+  policies: []
+",
+    );
+
+    let threshold_registry = StaticRuleRegistry::new(
+        vec!["HighLowLogicRule", "NegativePriceRule", "TickSizeRule", "VwapRangeRule"],
+        vec!["IntraBarLogic"],
+    );
+    let err = load_and_validate_config(&cfg_path, &threshold_registry).expect_err("must fail");
+    match err {
+        ConfigError::Schema(v) => assert!(v.contains("unsupported rules.version")),
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn rule_params_accept_extension_keys_and_override_known_thresholds() {
+    let dir = tempdir().expect("tmp dir");
+    let cfg_path = dir.path().join("rule_params.yaml");
+    write_file(
+        &cfg_path,
+        "mode: review-only
+input:
+  path: data/raw.csv
+  format: csv
+  schema:
+    date: date
+    ticker: ticker
+    open: open
+    high: high
+    low: low
+    close: close
+    vwap: vwap
+    volume: volume
+    turnover: turnover
+    status: status
+rules:
+  version: 1
+  enabled_categories: [\"IntraBarLogic\"]
+  enabled_rules: []
+  disabled_rules: []
+  thresholds:
+    HighLowLogicRule:
+      epsilon: 0.02
+  params:
+    HighLowLogicRule:
+      epsilon: 0.03
+      future_toggle: enabled
+handling:
+  policies: []
+",
+    );
+
+    let threshold_registry = StaticRuleRegistry::new(
+        vec!["HighLowLogicRule", "NegativePriceRule", "TickSizeRule", "VwapRangeRule"],
+        vec!["IntraBarLogic"],
+    );
+    let cfg = load_and_validate_config(&cfg_path, &threshold_registry).expect("config should parse");
+
+    assert_eq!(cfg.rules.version, 1);
+    let epsilon = cfg
+        .rules
+        .thresholds
+        .get("HighLowLogicRule")
+        .and_then(|m| m.get("epsilon"))
+        .expect("epsilon configured");
+    assert_eq!(*epsilon, "0.03".parse().expect("decimal"));
+
+    let future_toggle = cfg
+        .rules
+        .params
+        .get("HighLowLogicRule")
+        .and_then(|m| m.get("future_toggle"))
+        .expect("future toggle preserved");
+    assert_eq!(future_toggle, "enabled");
 }
 
 #[test]

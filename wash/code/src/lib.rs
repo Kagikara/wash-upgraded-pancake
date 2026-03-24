@@ -689,137 +689,8 @@ pub struct PerformanceSummaryInput<'a> {
     pub rule_time_breakdown: HashMap<String, u128>,
 }
 
-pub trait PerformanceSummaryBuilder: Send + Sync {
-    fn build(&self, input: PerformanceSummaryInput<'_>) -> PerformanceSummary;
-}
-
-pub trait AuditLogWriter: Send + Sync {
-    fn write(
-        &self,
-        audit_entries: &[AuditEntry],
-        performance_summary: &PerformanceSummary,
-        output_json: &Path,
-        output_csv: &Path,
-    ) -> Result<(), AuditError>;
-}
-
-pub trait AuditService: Send + Sync {
-    fn publish(
-        &self,
-        audit_entries: &[AuditEntry],
-        summary_input: PerformanceSummaryInput<'_>,
-        output_json: &Path,
-        output_csv: &Path,
-    ) -> Result<PerformanceSummary, AuditError>;
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DefaultPerformanceSummaryBuilder;
-
-impl PerformanceSummaryBuilder for DefaultPerformanceSummaryBuilder {
-    fn build(&self, input: PerformanceSummaryInput<'_>) -> PerformanceSummary {
-        build_performance_summary(
-            input.total_rows,
-            input.total_issues,
-            input.disabled_issues,
-            input.load_error_count,
-            input.cleaner_output,
-            input.total_time_ms,
-            input.rule_time_breakdown,
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FileAuditLogWriter;
-
-impl AuditLogWriter for FileAuditLogWriter {
-    fn write(
-        &self,
-        audit_entries: &[AuditEntry],
-        performance_summary: &PerformanceSummary,
-        output_json: &Path,
-        output_csv: &Path,
-    ) -> Result<(), AuditError> {
-        if let Some(parent) = output_json.parent() {
-            fs::create_dir_all(parent).map_err(|e| AuditError::Persist(format!("{}", e)))?;
-        }
-        if let Some(parent) = output_csv.parent() {
-            fs::create_dir_all(parent).map_err(|e| AuditError::Persist(format!("{}", e)))?;
-        }
-
-        fs::write(output_json, render_audit_json(audit_entries, performance_summary)).map_err(|e| {
-            AuditError::Persist(format!("{}: {}", output_json.display(), e))
-        })?;
-
-        let mut csv_out = String::from(
-            "timestamp,stage,ticker,date,issue_type,category,rule_name,field,old_value,new_value,action,action_source,comment\n",
-        );
-        for entry in audit_entries {
-            csv_out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-                csv_escape(&entry.timestamp),
-                csv_escape(entry.stage.as_str()),
-                csv_escape(&entry.ticker),
-                csv_escape(&entry.date),
-                csv_escape(&entry.issue_type),
-                csv_escape(&entry.category),
-                csv_escape(&entry.rule_name),
-                csv_escape(&entry.field),
-                csv_escape(&entry.old_value),
-                csv_escape(&entry.new_value),
-                csv_escape(&entry.action),
-                csv_escape(audit_action_source_name(entry.action_source)),
-                csv_escape(&entry.comment)
-            ));
-        }
-
-        fs::write(output_csv, csv_out)
-            .map_err(|e| AuditError::Persist(format!("{}: {}", output_csv.display(), e)))
-    }
-}
-
-pub struct DefaultAuditService<B, W>
-where
-    B: PerformanceSummaryBuilder,
-    W: AuditLogWriter,
-{
-    summary_builder: B,
-    writer: W,
-}
-
-impl<B, W> DefaultAuditService<B, W>
-where
-    B: PerformanceSummaryBuilder,
-    W: AuditLogWriter,
-{
-    pub fn new(summary_builder: B, writer: W) -> Self {
-        Self {
-            summary_builder,
-            writer,
-        }
-    }
-}
-
-impl<B, W> AuditService for DefaultAuditService<B, W>
-where
-    B: PerformanceSummaryBuilder,
-    W: AuditLogWriter,
-{
-    fn publish(
-        &self,
-        audit_entries: &[AuditEntry],
-        summary_input: PerformanceSummaryInput<'_>,
-        output_json: &Path,
-        output_csv: &Path,
-    ) -> Result<PerformanceSummary, AuditError> {
-        let performance_summary = self.summary_builder.build(summary_input);
-        self.writer
-            .write(audit_entries, &performance_summary, output_json, output_csv)?;
-        Ok(performance_summary)
-    }
-}
-
+mod audit;
+pub use audit::*;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmReportConfig {
     pub enabled: bool,
@@ -1285,536 +1156,11 @@ impl ValidationModule {
     }
 }
 
-pub trait PolicyResolver: Send + Sync {
-    fn resolve_policy(&self, issue: &Issue, handling: &HandlingConfig) -> Option<PolicyConfig>;
-}
-
-pub trait PolicyExecutor: Send + Sync {
-    fn apply_policy(
-        &self,
-        record: &mut Record,
-        issue: &Issue,
-        policy: &PolicyConfig,
-    ) -> Result<PolicyApplyResult, CleanerError>;
-}
-
-pub trait LoadErrorAuditMapper: Send + Sync {
-    fn map(&self, load_errors: &[LoadError]) -> Vec<AuditEntry>;
-}
-
-pub trait CleanerStage: Send + Sync {
-    fn run(
-        &self,
-        records: &[Record],
-        approved_issues: &[Issue],
-        load_errors: &[LoadError],
-        handling: &HandlingConfig,
-    ) -> Result<CleanerOutput, CleanerError>;
-}
-
-/// Cleaner stage applies policies on approved issues and emits audit entries.
-///
-/// Note that load errors are converted into audit entries and merged into the
-/// same output stream for downstream reporting consistency.
-pub struct DefaultCleanerStage<R, E, M>
-where
-    R: PolicyResolver,
-    E: PolicyExecutor,
-    M: LoadErrorAuditMapper,
-{
-    resolver: R,
-    executor: E,
-    load_error_mapper: M,
-}
-
-impl<R, E, M> DefaultCleanerStage<R, E, M>
-where
-    R: PolicyResolver,
-    E: PolicyExecutor,
-    M: LoadErrorAuditMapper,
-{
-    pub fn new(resolver: R, executor: E, load_error_mapper: M) -> Self {
-        Self {
-            resolver,
-            executor,
-            load_error_mapper,
-        }
-    }
-
-    fn issue_index(issues: &[Issue]) -> HashMap<(String, String), Vec<Issue>> {
-        // Group by (ticker, date) to avoid O(records * issues) scans.
-        let mut out: HashMap<(String, String), Vec<Issue>> = HashMap::new();
-        for issue in issues {
-            out.entry((issue.ticker.clone(), issue.date.clone()))
-                .or_default()
-                .push(issue.clone());
-        }
-        out
-    }
-}
-
-impl<R, E, M> CleanerStage for DefaultCleanerStage<R, E, M>
-where
-    R: PolicyResolver,
-    E: PolicyExecutor,
-    M: LoadErrorAuditMapper,
-{
-    fn run(
-        &self,
-        records: &[Record],
-        approved_issues: &[Issue],
-        load_errors: &[LoadError],
-        handling: &HandlingConfig,
-    ) -> Result<CleanerOutput, CleanerError> {
-        let mut cleaned_records = records.to_vec();
-        let mut audit_entries = self.load_error_mapper.map(load_errors);
-        let issue_index = Self::issue_index(approved_issues);
-        let record_keys = cleaned_records
-            .iter()
-            .map(|r| (r.ticker.clone(), r.date.clone()))
-            .collect::<HashSet<_>>();
-
-        let mut processed_issues = 0usize;
-        let mut unresolved_issues = 0usize;
-
-        for (idx, record) in cleaned_records.iter_mut().enumerate() {
-            let key = (record.ticker.clone(), record.date.clone());
-            if let Some(issues) = issue_index.get(&key) {
-                for issue in issues {
-                    let old_value = record_field_value(record, &issue.field)?;
-
-                    let Some(policy) = self.resolver.resolve_policy(issue, handling) else {
-                        // Missing policy is tracked as unresolved instead of failing
-                        // hard, so the pipeline can still produce auditable output.
-                        unresolved_issues += 1;
-                        audit_entries.push(new_audit_entry(
-                            issue,
-                            old_value.clone(),
-                            old_value,
-                            "UNRESOLVED".to_string(),
-                            AuditActionSource::Disabled,
-                            "No policy configured for this issue".to_string(),
-                        ));
-                        continue;
-                    };
-
-                    let applied = self.executor.apply_policy(record, issue, &policy)?;
-                    processed_issues += 1;
-                    audit_entries.push(new_audit_entry(
-                        issue,
-                        applied.old_value,
-                        applied.new_value,
-                        applied.action,
-                        applied.action_source,
-                        applied.comment,
-                    ));
-                }
-            }
-
-            ValidationModule::validate_row(&records[idx], record)?;
-        }
-
-        // Some issues (for example MissingDatesRule) may reference synthetic
-        // dates with no physical record row. Keep them auditable as unresolved.
-        for issue in approved_issues {
-            let key = (issue.ticker.clone(), issue.date.clone());
-            if record_keys.contains(&key) {
-                continue;
-            }
-
-            unresolved_issues += 1;
-            audit_entries.push(new_audit_entry(
-                issue,
-                issue.value.clone(),
-                issue.value.clone(),
-                "UNRESOLVED".to_string(),
-                AuditActionSource::Disabled,
-                "No matching record found for this issue key".to_string(),
-            ));
-        }
-
-        Ok(CleanerOutput {
-            cleaned_records,
-            audit_entries,
-            processed_issues,
-            unresolved_issues,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RuleNamePolicyResolver;
-
-impl PolicyResolver for RuleNamePolicyResolver {
-    fn resolve_policy(&self, issue: &Issue, handling: &HandlingConfig) -> Option<PolicyConfig> {
-        handling
-            .policies
-            .iter()
-            .find(|p| p.rule_name == issue.rule_name)
-            .cloned()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoopPolicyExecutor;
-
-impl PolicyExecutor for NoopPolicyExecutor {
-    fn apply_policy(
-        &self,
-        record: &mut Record,
-        issue: &Issue,
-        policy: &PolicyConfig,
-    ) -> Result<PolicyApplyResult, CleanerError> {
-        let old_value = record_field_value(record, &issue.field)?;
-        Ok(PolicyApplyResult {
-            action: policy.action.clone(),
-            old_value: old_value.clone(),
-            new_value: old_value,
-            action_source: AuditActionSource::Auto,
-            comment: "Noop executor did not change record".to_string(),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BuiltinPolicyExecutor;
-
-impl PolicyExecutor for BuiltinPolicyExecutor {
-    fn apply_policy(
-        &self,
-        record: &mut Record,
-        issue: &Issue,
-        policy: &PolicyConfig,
-    ) -> Result<PolicyApplyResult, CleanerError> {
-        let old_value = record_field_value(record, &issue.field)?;
-
-        match policy.action.as_str() {
-            "set_literal" => {
-                let value_raw = required_param_str(policy, "value")?;
-                set_record_field(record, &issue.field, value_raw)?;
-
-                Ok(PolicyApplyResult {
-                    action: policy.action.clone(),
-                    old_value,
-                    new_value: record_field_value(record, &issue.field)?,
-                    action_source: AuditActionSource::Auto,
-                    comment: format!("set {} with literal value", issue.field),
-                })
-            }
-            "clamp_field" => {
-                let min_field = required_param_str(policy, "min_field")?;
-                let max_field = required_param_str(policy, "max_field")?;
-
-                let min = parse_decimal_field(record, min_field)?;
-                let max = parse_decimal_field(record, max_field)?;
-                let value = parse_decimal_field(record, &issue.field)?;
-
-                let clamped = if value < min {
-                    min
-                } else if value > max {
-                    max
-                } else {
-                    value
-                };
-
-                set_record_field(record, &issue.field, &clamped.to_string())?;
-
-                Ok(PolicyApplyResult {
-                    action: policy.action.clone(),
-                    old_value,
-                    new_value: record_field_value(record, &issue.field)?,
-                    action_source: AuditActionSource::Auto,
-                    comment: format!("clamped {} to [{}, {}]", issue.field, min_field, max_field),
-                })
-            }
-            other => Err(CleanerError::PolicyExecution {
-                rule_name: issue.rule_name.clone(),
-                detail: format!("unsupported action: {other}"),
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DefaultLoadErrorAuditMapper;
-
-impl LoadErrorAuditMapper for DefaultLoadErrorAuditMapper {
-    fn map(&self, load_errors: &[LoadError]) -> Vec<AuditEntry> {
-        let mut out = Vec::with_capacity(load_errors.len());
-        for load_error in load_errors {
-            out.push(AuditEntry {
-                timestamp: now_epoch_millis(),
-                stage: AuditStage::Load,
-                ticker: String::new(),
-                date: String::new(),
-                issue_type: "LOAD_ERROR".to_string(),
-                category: "Loader".to_string(),
-                rule_name: "Loader::parse_csv_row".to_string(),
-                field: "raw_row".to_string(),
-                old_value: load_error.raw_row.clone(),
-                new_value: load_error.raw_row.clone(),
-                action: "LOAD_ERROR".to_string(),
-                action_source: AuditActionSource::Loader,
-                comment: format!(
-                    "row={}, code={:?}, detail={}",
-                    load_error.row_number, load_error.error_code, load_error.error_detail
-                ),
-            });
-        }
-        out
-    }
-}
-
-pub fn build_performance_summary(
-    total_rows: usize,
-    total_issues: usize,
-    disabled_issues: usize,
-    load_error_count: usize,
-    cleaner_output: &CleanerOutput,
-    total_time_ms: u128,
-    rule_time_breakdown: HashMap<String, u128>,
-) -> PerformanceSummary {
-    let throughput_rows_per_sec = if total_time_ms == 0 {
-        0
-    } else {
-        ((total_rows as u128 * 1000u128) / total_time_ms) as u64
-    };
-
-    PerformanceSummary {
-        total_rows,
-        total_issues,
-        processed_issues: cleaner_output.processed_issues,
-        unresolved_issues: cleaner_output.unresolved_issues,
-        disabled_issues,
-        load_error_count,
-        total_time_ms,
-        throughput_rows_per_sec,
-        rule_time_breakdown,
-    }
-}
-
-fn record_field_value(record: &Record, field: &str) -> Result<String, CleanerError> {
-    match field {
-        "date" => Ok(record.date.clone()),
-        "ticker" => Ok(record.ticker.clone()),
-        "open" => Ok(record.open.to_string()),
-        "high" => Ok(record.high.to_string()),
-        "low" => Ok(record.low.to_string()),
-        "close" => Ok(record.close.to_string()),
-        "vwap" => Ok(record.vwap.to_string()),
-        "price" => Ok(format!(
-            "open={},high={},low={},close={},vwap={}",
-            record.open, record.high, record.low, record.close, record.vwap
-        )),
-        "volume" => Ok(record.volume.to_string()),
-        "turnover" => Ok(record.turnover.to_string()),
-        "status" => Ok(format!("{:?}", record.status)),
-        other => Err(CleanerError::UnknownField(other.to_string())),
-    }
-}
-
-fn set_record_field(record: &mut Record, field: &str, value: &str) -> Result<(), CleanerError> {
-    match field {
-        "date" => {
-            record.date = value.to_string();
-            Ok(())
-        }
-        "ticker" => {
-            record.ticker = value.to_string();
-            Ok(())
-        }
-        "open" => {
-            record.open = parse_decimal_literal(value, field)?;
-            Ok(())
-        }
-        "high" => {
-            record.high = parse_decimal_literal(value, field)?;
-            Ok(())
-        }
-        "low" => {
-            record.low = parse_decimal_literal(value, field)?;
-            Ok(())
-        }
-        "close" => {
-            record.close = parse_decimal_literal(value, field)?;
-            Ok(())
-        }
-        "vwap" => {
-            record.vwap = parse_decimal_literal(value, field)?;
-            Ok(())
-        }
-        "volume" => {
-            record.volume = parse_decimal_literal(value, field)?;
-            Ok(())
-        }
-        "turnover" => {
-            record.turnover = parse_decimal_literal(value, field)?;
-            Ok(())
-        }
-        "status" => {
-            record.status = TradeStatus::parse(value);
-            Ok(())
-        }
-        other => Err(CleanerError::UnknownField(other.to_string())),
-    }
-}
-
-fn parse_decimal_literal(raw: &str, field: &str) -> Result<Decimal, CleanerError> {
-    Decimal::from_str(raw).map_err(|_| CleanerError::PolicyExecution {
-        rule_name: "PolicyParam".to_string(),
-        detail: format!("invalid decimal literal for {field}: {raw}"),
-    })
-}
-
-fn required_param_str<'a>(policy: &'a PolicyConfig, key: &str) -> Result<&'a str, CleanerError> {
-    policy
-        .params
-        .get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| CleanerError::PolicyExecution {
-            rule_name: policy.rule_name.clone(),
-            detail: format!("missing or invalid string param: {key}"),
-        })
-}
-
-fn parse_decimal_field(record: &Record, field: &str) -> Result<Decimal, CleanerError> {
-    let raw = record_field_value(record, field)?;
-    Decimal::from_str(&raw).map_err(|_| CleanerError::PolicyExecution {
-        rule_name: "PolicyParam".to_string(),
-        detail: format!("field is not decimal-compatible: {field}"),
-    })
-}
-
-fn new_audit_entry(
-    issue: &Issue,
-    old_value: String,
-    new_value: String,
-    action: String,
-    action_source: AuditActionSource,
-    comment: String,
-) -> AuditEntry {
-    AuditEntry {
-        timestamp: now_epoch_millis(),
-        stage: AuditStage::Clean,
-        ticker: issue.ticker.clone(),
-        date: issue.date.clone(),
-        issue_type: format!("{:?}", issue.issue_type),
-        category: issue.category.clone(),
-        rule_name: issue.rule_name.clone(),
-        field: issue.field.clone(),
-        old_value,
-        new_value,
-        action,
-        action_source,
-        comment,
-    }
-}
-
-fn now_epoch_millis() -> String {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_millis().to_string(),
-        Err(_) => "0".to_string(),
-    }
-}
-
-fn audit_action_source_name(source: AuditActionSource) -> &'static str {
-    match source {
-        AuditActionSource::Auto => "AUTO",
-        AuditActionSource::Manual => "MANUAL",
-        AuditActionSource::Disabled => "DISABLED",
-        AuditActionSource::Loader => "LOADER",
-    }
-}
-
-fn render_audit_json(audit_entries: &[AuditEntry], performance_summary: &PerformanceSummary) -> String {
-    let mut out = String::new();
-    out.push_str("{\n  \"audit_entries\": [\n");
-
-    for (idx, entry) in audit_entries.iter().enumerate() {
-        if idx > 0 {
-            out.push_str(",\n");
-        }
-        out.push_str("    {");
-        out.push_str(&format!(
-            "\"timestamp\":\"{}\",\"stage\":\"{}\",\"ticker\":\"{}\",\"date\":\"{}\",\"issue_type\":\"{}\",\"category\":\"{}\",\"rule_name\":\"{}\",\"field\":\"{}\",\"old_value\":\"{}\",\"new_value\":\"{}\",\"action\":\"{}\",\"action_source\":\"{}\",\"comment\":\"{}\"",
-            json_escape(&entry.timestamp),
-            json_escape(entry.stage.as_str()),
-            json_escape(&entry.ticker),
-            json_escape(&entry.date),
-            json_escape(&entry.issue_type),
-            json_escape(&entry.category),
-            json_escape(&entry.rule_name),
-            json_escape(&entry.field),
-            json_escape(&entry.old_value),
-            json_escape(&entry.new_value),
-            json_escape(&entry.action),
-            json_escape(audit_action_source_name(entry.action_source)),
-            json_escape(&entry.comment)
-        ));
-        out.push('}');
-    }
-
-    out.push_str("\n  ],\n");
-    out.push_str("  \"performance\": {\n");
-    out.push_str(&format!(
-        "    \"total_rows\": {},\n    \"load_error_count\": {},\n    \"total_issues\": {},\n    \"processed_issues\": {},\n    \"unresolved_issues\": {},\n    \"disabled_issues\": {},\n    \"total_time_ms\": {},\n    \"throughput_rows_per_sec\": {},\n    \"rule_time_breakdown\": {}\n",
-        performance_summary.total_rows,
-        performance_summary.load_error_count,
-        performance_summary.total_issues,
-        performance_summary.processed_issues,
-        performance_summary.unresolved_issues,
-        performance_summary.disabled_issues,
-        performance_summary.total_time_ms,
-        performance_summary.throughput_rows_per_sec,
-        render_rule_time_breakdown_json(&performance_summary.rule_time_breakdown)
-    ));
-    out.push_str("  }\n}\n");
-
-    out
-}
-
-fn render_rule_time_breakdown_json(rule_time_breakdown: &HashMap<String, u128>) -> String {
-    let mut pairs = rule_time_breakdown.iter().collect::<Vec<_>>();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
-
-    let mut out = String::from("{");
-    for (idx, (rule_name, elapsed_ms)) in pairs.into_iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "\"{}\":{}",
-            json_escape(rule_name),
-            elapsed_ms
-        ));
-    }
-    out.push('}');
-    out
-}
-
-fn json_escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn csv_escape(raw: &str) -> String {
-    if raw.contains(',') || raw.contains('"') || raw.contains('\n') || raw.contains('\r') {
-        format!("\"{}\"", raw.replace('"', "\"\""))
-    } else {
-        raw.to_string()
-    }
-}
-
+mod cleaner;
+pub use cleaner::*;
+pub(crate) use cleaner::{
+    audit_action_source_name, csv_escape, json_escape, now_epoch_millis, render_audit_json,
+};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunMode {
     ReviewOnly,
@@ -1882,16 +1228,57 @@ pub struct RuleSourceConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleSwitchConfig {
+    pub version: u32,
     pub enabled_categories: Vec<String>,
     pub enabled_rules: Vec<String>,
     pub disabled_rules: Vec<String>,
+    pub params: HashMap<String, HashMap<String, String>>,
+    pub thresholds: HashMap<String, HashMap<String, Decimal>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleThresholdMetadata {
+    pub key: String,
+    pub description: String,
+    pub default_value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleMetadata {
+    pub name: String,
+    pub category: String,
+    pub required_fields: Vec<String>,
+    pub default_severity: RuleSeverity,
+    pub configurable_thresholds: Vec<RuleThresholdMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyConfig {
     pub rule_name: String,
-    pub action: String,
-    pub params: serde_yaml::Value,
+    pub action: PolicyAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyAction {
+    SetLiteral { value: String },
+    ClampField { min_field: String, max_field: String },
+}
+
+impl PolicyAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::SetLiteral { .. } => "set_literal",
+            Self::ClampField { .. } => "clamp_field",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -2043,6 +1430,8 @@ pub struct ValidationPlan {
     pub enabled_categories: HashSet<String>,
     pub enabled_rules: HashSet<String>,
     pub disabled_rules: HashSet<String>,
+    pub params: HashMap<String, HashMap<String, String>>,
+    pub thresholds: HashMap<String, HashMap<String, Decimal>>,
 }
 
 impl ValidationPlan {
@@ -2051,7 +1440,17 @@ impl ValidationPlan {
             enabled_categories: switch.enabled_categories.iter().cloned().collect(),
             enabled_rules: switch.enabled_rules.iter().cloned().collect(),
             disabled_rules: switch.disabled_rules.iter().cloned().collect(),
+            params: switch.params.clone(),
+            thresholds: switch.thresholds.clone(),
         }
+    }
+
+    pub fn threshold_or_default(&self, rule_name: &str, key: &str, default_value: Decimal) -> Decimal {
+        self.thresholds
+            .get(rule_name)
+            .and_then(|m| m.get(key))
+            .cloned()
+            .unwrap_or(default_value)
     }
 }
 
@@ -2068,427 +1467,11 @@ pub struct ValidationOutput {
     pub issues: Vec<Issue>,
     pub metrics: Vec<RuleMetric>,
     pub total_issues: usize,
+    pub rule_metadata: Vec<RuleMetadata>,
 }
 
-pub trait ValidationRule: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn category(&self) -> &'static str;
-    fn validate(&self, records: &[Record], ctx: &ValidationContext) -> Result<Vec<Issue>, ValidationError>;
-}
-
-pub struct ValidationRegistry {
-    rules: Vec<Box<dyn ValidationRule>>,
-}
-
-impl ValidationRegistry {
-    pub fn default() -> Self {
-        Self {
-            rules: vec![
-                Box::new(MissingDatesRule),
-                Box::new(DuplicateDatesRule),
-                Box::new(NonTradingDayRule),
-                Box::new(HighLowLogicRule),
-                Box::new(NegativePriceRule),
-                Box::new(TickSizeRule),
-                Box::new(VwapRangeRule),
-            ],
-        }
-    }
-
-    fn all_rule_names(&self) -> HashSet<String> {
-        self.rules.iter().map(|r| r.name().to_string()).collect()
-    }
-
-    fn all_categories(&self) -> HashSet<String> {
-        self.rules.iter().map(|r| r.category().to_string()).collect()
-    }
-
-    fn select_rules(&self, plan: &ValidationPlan) -> Result<Vec<&dyn ValidationRule>, ValidationError> {
-        let all_categories = self.all_categories();
-        for category in &plan.enabled_categories {
-            if !all_categories.contains(category) {
-                return Err(ValidationError::UnknownCategory(category.clone()));
-            }
-        }
-
-        let all_rule_names = self.all_rule_names();
-        for rule in &plan.enabled_rules {
-            if !all_rule_names.contains(rule) {
-                return Err(ValidationError::UnknownRule(rule.clone()));
-            }
-        }
-
-        for rule in &plan.disabled_rules {
-            if !all_rule_names.contains(rule) {
-                return Err(ValidationError::UnknownRule(rule.clone()));
-            }
-        }
-
-        let use_enabled_rules = !plan.enabled_rules.is_empty();
-
-        let selected = self
-            .rules
-            .iter()
-            .filter(|rule| {
-                if plan.disabled_rules.contains(rule.name()) {
-                    return false;
-                }
-
-                if use_enabled_rules {
-                    return plan.enabled_rules.contains(rule.name());
-                }
-
-                if !plan.enabled_categories.is_empty() {
-                    return plan.enabled_categories.contains(rule.category());
-                }
-
-                true
-            })
-            .map(|rule| rule.as_ref())
-            .collect();
-
-        Ok(selected)
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum ValidationError {
-    #[error("unknown category: {0}")]
-    UnknownCategory(String),
-    #[error("unknown rule: {0}")]
-    UnknownRule(String),
-    #[error("rule execution failed: {rule_name}: {detail}")]
-    RuleExecution { rule_name: String, detail: String },
-}
-
-pub fn validate_records(
-    records: &[Record],
-    ctx: &ValidationContext,
-    plan: &ValidationPlan,
-    registry: &ValidationRegistry,
-) -> Result<ValidationOutput, ValidationError> {
-    // Resolve actual executable rule set from user switches.
-    let selected_rules = registry.select_rules(plan)?;
-
-    let mut issues = Vec::new();
-    let mut metrics = Vec::new();
-
-    for rule in selected_rules {
-        // Measure each rule to feed performance / hot-spot diagnostics.
-        let start = Instant::now();
-        let mut rule_issues = rule.validate(records, ctx)?;
-        let elapsed = start.elapsed();
-        let issue_count = rule_issues.len();
-
-        issues.append(&mut rule_issues);
-        metrics.push(RuleMetric {
-            rule_name: rule.name().to_string(),
-            category: rule.category().to_string(),
-            elapsed,
-            issue_count,
-        });
-    }
-
-    issues.sort_by(|a, b| {
-        (&a.ticker, &a.date, &a.rule_name, &a.field, &a.detail).cmp(&(
-            &b.ticker,
-            &b.date,
-            &b.rule_name,
-            &b.field,
-            &b.detail,
-        ))
-    });
-
-    Ok(ValidationOutput {
-        total_issues: issues.len(),
-        issues,
-        metrics,
-    })
-}
-
-struct MissingDatesRule;
-
-impl ValidationRule for MissingDatesRule {
-    fn name(&self) -> &'static str {
-        "MissingDatesRule"
-    }
-
-    fn category(&self) -> &'static str {
-        "DataIntegrity"
-    }
-
-    fn validate(&self, records: &[Record], ctx: &ValidationContext) -> Result<Vec<Issue>, ValidationError> {
-        let mut grouped: HashMap<&str, Vec<&Record>> = HashMap::new();
-        for row in records {
-            grouped.entry(&row.ticker).or_default().push(row);
-        }
-
-        let mut issues = Vec::new();
-        for (ticker, mut rows) in grouped {
-            rows.sort_by(|a, b| a.date.cmp(&b.date));
-            for pair in rows.windows(2) {
-                let prev = pair[0];
-                let cur = pair[1];
-                let missing_days = ctx.missing_days_between(&prev.date, &cur.date);
-                if !missing_days.is_empty() {
-                    issues.push(Issue {
-                        issue_type: IssueType::MissingDates,
-                        category: self.category().to_string(),
-                        rule_name: self.name().to_string(),
-                        ticker: ticker.to_string(),
-                        date: missing_days.join("|"),
-                        field: "date".to_string(),
-                        value: "gap".to_string(),
-                        detail: "Trading days missing between records".to_string(),
-                    });
-                }
-            }
-        }
-
-        Ok(issues)
-    }
-}
-
-struct DuplicateDatesRule;
-
-impl ValidationRule for DuplicateDatesRule {
-    fn name(&self) -> &'static str {
-        "DuplicateDatesRule"
-    }
-
-    fn category(&self) -> &'static str {
-        "DataIntegrity"
-    }
-
-    fn validate(&self, records: &[Record], _ctx: &ValidationContext) -> Result<Vec<Issue>, ValidationError> {
-        let mut seen = HashSet::new();
-        let mut issues = Vec::new();
-
-        for row in records {
-            let key = (row.ticker.as_str(), row.date.as_str());
-            if seen.contains(&key) {
-                issues.push(Issue {
-                    issue_type: IssueType::DuplicateDate,
-                    category: self.category().to_string(),
-                    rule_name: self.name().to_string(),
-                    ticker: row.ticker.clone(),
-                    date: row.date.clone(),
-                    field: "date".to_string(),
-                    value: row.date.clone(),
-                    detail: "Multiple rows for same ticker & date".to_string(),
-                });
-            } else {
-                seen.insert(key);
-            }
-        }
-
-        Ok(issues)
-    }
-}
-
-struct NonTradingDayRule;
-
-impl ValidationRule for NonTradingDayRule {
-    fn name(&self) -> &'static str {
-        "NonTradingDayRule"
-    }
-
-    fn category(&self) -> &'static str {
-        "DataIntegrity"
-    }
-
-    fn validate(&self, records: &[Record], ctx: &ValidationContext) -> Result<Vec<Issue>, ValidationError> {
-        let mut issues = Vec::new();
-        for row in records {
-            if !ctx.is_trading_day(&row.date) {
-                issues.push(Issue {
-                    issue_type: IssueType::NonTradingDayData,
-                    category: self.category().to_string(),
-                    rule_name: self.name().to_string(),
-                    ticker: row.ticker.clone(),
-                    date: row.date.clone(),
-                    field: "date".to_string(),
-                    value: row.date.clone(),
-                    detail: "Data exists on non-trading day".to_string(),
-                });
-            }
-        }
-        Ok(issues)
-    }
-}
-
-struct HighLowLogicRule;
-
-impl ValidationRule for HighLowLogicRule {
-    fn name(&self) -> &'static str {
-        "HighLowLogicRule"
-    }
-
-    fn category(&self) -> &'static str {
-        "IntraBarLogic"
-    }
-
-    fn validate(&self, records: &[Record], _ctx: &ValidationContext) -> Result<Vec<Issue>, ValidationError> {
-        let mut issues = Vec::new();
-
-        for row in records {
-            let max_other = row.open.max(row.close).max(row.low);
-            if row.high < max_other {
-                issues.push(Issue {
-                    issue_type: IssueType::HighBelowOthers,
-                    category: self.category().to_string(),
-                    rule_name: self.name().to_string(),
-                    ticker: row.ticker.clone(),
-                    date: row.date.clone(),
-                    field: "high".to_string(),
-                    value: row.high.to_string(),
-                    detail: "High is below Open/Close/Low".to_string(),
-                });
-            }
-
-            let min_other = row.open.min(row.close).min(row.high);
-            if row.low > min_other {
-                issues.push(Issue {
-                    issue_type: IssueType::LowAboveOthers,
-                    category: self.category().to_string(),
-                    rule_name: self.name().to_string(),
-                    ticker: row.ticker.clone(),
-                    date: row.date.clone(),
-                    field: "low".to_string(),
-                    value: row.low.to_string(),
-                    detail: "Low is above Open/Close/High".to_string(),
-                });
-            }
-        }
-
-        Ok(issues)
-    }
-}
-
-struct NegativePriceRule;
-
-impl ValidationRule for NegativePriceRule {
-    fn name(&self) -> &'static str {
-        "NegativePriceRule"
-    }
-
-    fn category(&self) -> &'static str {
-        "IntraBarLogic"
-    }
-
-    fn validate(&self, records: &[Record], _ctx: &ValidationContext) -> Result<Vec<Issue>, ValidationError> {
-        let mut issues = Vec::new();
-
-        for row in records {
-            if row.open < Decimal::ZERO
-                || row.high < Decimal::ZERO
-                || row.low < Decimal::ZERO
-                || row.close < Decimal::ZERO
-                || row.vwap < Decimal::ZERO
-            {
-                issues.push(Issue {
-                    issue_type: IssueType::NegativePrice,
-                    category: self.category().to_string(),
-                    rule_name: self.name().to_string(),
-                    ticker: row.ticker.clone(),
-                    date: row.date.clone(),
-                    field: "price".to_string(),
-                    value: format!(
-                        "open={},high={},low={},close={},vwap={}",
-                        row.open, row.high, row.low, row.close, row.vwap
-                    ),
-                    detail: "Negative price not allowed".to_string(),
-                });
-            }
-        }
-
-        Ok(issues)
-    }
-}
-
-struct TickSizeRule;
-
-impl ValidationRule for TickSizeRule {
-    fn name(&self) -> &'static str {
-        "TickSizeRule"
-    }
-
-    fn category(&self) -> &'static str {
-        "IntraBarLogic"
-    }
-
-    fn validate(&self, records: &[Record], ctx: &ValidationContext) -> Result<Vec<Issue>, ValidationError> {
-        let mut issues = Vec::new();
-        if ctx.tick_size <= Decimal::ZERO {
-            return Ok(issues);
-        }
-
-        for row in records {
-            let invalid = !is_valid_tick(row.open, ctx.tick_size)
-                || !is_valid_tick(row.high, ctx.tick_size)
-                || !is_valid_tick(row.low, ctx.tick_size)
-                || !is_valid_tick(row.close, ctx.tick_size)
-                || !is_valid_tick(row.vwap, ctx.tick_size);
-
-            if invalid {
-                issues.push(Issue {
-                    issue_type: IssueType::InvalidTickSize,
-                    category: self.category().to_string(),
-                    rule_name: self.name().to_string(),
-                    ticker: row.ticker.clone(),
-                    date: row.date.clone(),
-                    field: "price".to_string(),
-                    value: format!(
-                        "open={},high={},low={},close={},vwap={}",
-                        row.open, row.high, row.low, row.close, row.vwap
-                    ),
-                    detail: "Price not aligned to tick size".to_string(),
-                });
-            }
-        }
-
-        Ok(issues)
-    }
-}
-
-struct VwapRangeRule;
-
-impl ValidationRule for VwapRangeRule {
-    fn name(&self) -> &'static str {
-        "VwapRangeRule"
-    }
-
-    fn category(&self) -> &'static str {
-        "IntraBarLogic"
-    }
-
-    fn validate(&self, records: &[Record], _ctx: &ValidationContext) -> Result<Vec<Issue>, ValidationError> {
-        let mut issues = Vec::new();
-
-        for row in records {
-            if row.vwap < row.low || row.vwap > row.high {
-                issues.push(Issue {
-                    issue_type: IssueType::VwapOutOfRange,
-                    category: self.category().to_string(),
-                    rule_name: self.name().to_string(),
-                    ticker: row.ticker.clone(),
-                    date: row.date.clone(),
-                    field: "vwap".to_string(),
-                    value: row.vwap.to_string(),
-                    detail: "VWAP is outside [Low, High]".to_string(),
-                });
-            }
-        }
-
-        Ok(issues)
-    }
-}
-
-fn is_valid_tick(value: Decimal, tick_size: Decimal) -> bool {
-    let rem = value % tick_size;
-    rem == Decimal::ZERO
-}
-
+mod rules;
+pub use rules::*;
 pub trait RuleRegistry {
     fn all_rules(&self) -> HashSet<String>;
     fn all_categories(&self) -> HashSet<String>;
@@ -2590,11 +1573,17 @@ struct RawPathNode {
 
 #[derive(Debug, Deserialize)]
 struct RawRules {
+    #[serde(default = "default_rules_config_version")]
+    version: u32,
     enabled_categories: Vec<String>,
     #[serde(default)]
     enabled_rules: Vec<String>,
     #[serde(default)]
     disabled_rules: Vec<String>,
+    #[serde(default)]
+    params: HashMap<String, HashMap<String, serde_yaml::Value>>,
+    #[serde(default)]
+    thresholds: HashMap<String, HashMap<String, serde_yaml::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2605,9 +1594,205 @@ struct RawHandling {
 #[derive(Debug, Deserialize)]
 struct RawPolicy {
     rule_name: String,
-    action: String,
+    action: serde_yaml::Value,
     #[serde(default)]
-    params: serde_yaml::Value,
+    params: Option<serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RawPolicyAction {
+    SetLiteral { value: String },
+    ClampField { min_field: String, max_field: String },
+}
+
+fn parse_policy_action(raw: &RawPolicy) -> Result<PolicyAction, ConfigError> {
+    if let Some(action_name) = raw.action.as_str() {
+        // Backward-compatible path for old configs using `action + params`.
+        let params = raw.params.as_ref().ok_or_else(|| {
+            ConfigError::Schema(format!(
+                "policy {} with action {} requires params object",
+                raw.rule_name, action_name
+            ))
+        })?;
+
+        let get_param = |key: &str| {
+            params.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+                ConfigError::Schema(format!(
+                    "policy {} action {} missing string param: {}",
+                    raw.rule_name, action_name, key
+                ))
+            })
+        };
+
+        return match action_name {
+            "set_literal" => Ok(PolicyAction::SetLiteral {
+                value: get_param("value")?.to_string(),
+            }),
+            "clamp_field" => Ok(PolicyAction::ClampField {
+                min_field: get_param("min_field")?.to_string(),
+                max_field: get_param("max_field")?.to_string(),
+            }),
+            _ => Err(ConfigError::Schema(format!(
+                "unsupported policy action: {}",
+                action_name
+            ))),
+        };
+    }
+
+    let tagged: RawPolicyAction = serde_yaml::from_value(raw.action.clone()).map_err(|e| {
+        ConfigError::Schema(format!(
+            "invalid tagged policy action for {}: {}",
+            raw.rule_name, e
+        ))
+    })?;
+
+    match tagged {
+        RawPolicyAction::SetLiteral { value } => Ok(PolicyAction::SetLiteral { value }),
+        RawPolicyAction::ClampField {
+            min_field,
+            max_field,
+        } => Ok(PolicyAction::ClampField {
+            min_field,
+            max_field,
+        }),
+    }
+}
+
+fn allowed_threshold_keys(rule_name: &str) -> &'static [&'static str] {
+    match rule_name {
+        "HighLowLogicRule" => &["epsilon"],
+        "NegativePriceRule" => &["min_allowed_price"],
+        "TickSizeRule" => &["remainder_tolerance"],
+        "VwapRangeRule" => &["tolerance"],
+        _ => &[],
+    }
+}
+
+const MIN_RULE_CONFIG_VERSION: u32 = 1;
+const MAX_RULE_CONFIG_VERSION: u32 = 1;
+
+fn default_rules_config_version() -> u32 {
+    MIN_RULE_CONFIG_VERSION
+}
+
+fn negotiate_rules_config_version(version: u32) -> Result<u32, ConfigError> {
+    if version < MIN_RULE_CONFIG_VERSION || version > MAX_RULE_CONFIG_VERSION {
+        return Err(ConfigError::Schema(format!(
+            "unsupported rules.version: {} (supported range: {}..={})",
+            version, MIN_RULE_CONFIG_VERSION, MAX_RULE_CONFIG_VERSION
+        )));
+    }
+    Ok(version)
+}
+
+fn parse_rule_params(
+    raw_params: &HashMap<String, HashMap<String, serde_yaml::Value>>,
+    all_rules: &HashSet<String>,
+) -> Result<HashMap<String, HashMap<String, String>>, ConfigError> {
+    let mut out = HashMap::new();
+
+    for (rule_name, params) in raw_params {
+        if !all_rules.contains(rule_name) {
+            return Err(ConfigError::UnknownRule(rule_name.clone()));
+        }
+
+        let mut parsed = HashMap::new();
+        for (key, value) in params {
+            let normalized = match value {
+                serde_yaml::Value::String(v) => v.clone(),
+                serde_yaml::Value::Number(v) => v.to_string(),
+                serde_yaml::Value::Bool(v) => v.to_string(),
+                serde_yaml::Value::Null => "null".to_string(),
+                _ => {
+                    return Err(ConfigError::Schema(format!(
+                        "rules.params value must be scalar for {}.{}",
+                        rule_name, key
+                    )));
+                }
+            };
+            parsed.insert(key.clone(), normalized);
+        }
+
+        out.insert(rule_name.clone(), parsed);
+    }
+
+    Ok(out)
+}
+
+fn apply_threshold_overrides_from_params(
+    params: &HashMap<String, HashMap<String, String>>,
+    thresholds: &mut HashMap<String, HashMap<String, Decimal>>,
+) -> Result<(), ConfigError> {
+    for (rule_name, values) in params {
+        let allowed = allowed_threshold_keys(rule_name);
+        if allowed.is_empty() {
+            continue;
+        }
+
+        for (key, value) in values {
+            if !allowed.contains(&key.as_str()) {
+                continue;
+            }
+
+            let parsed = Decimal::from_str(value).map_err(|_| {
+                ConfigError::Schema(format!(
+                    "rules.params value must be decimal for {}.{}",
+                    rule_name, key
+                ))
+            })?;
+
+            thresholds
+                .entry(rule_name.clone())
+                .or_default()
+                .insert(key.clone(), parsed);
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_rule_thresholds(
+    raw_thresholds: &HashMap<String, HashMap<String, serde_yaml::Value>>,
+    all_rules: &HashSet<String>,
+) -> Result<HashMap<String, HashMap<String, Decimal>>, ConfigError> {
+    let mut out = HashMap::new();
+
+    for (rule_name, threshold_values) in raw_thresholds {
+        if !all_rules.contains(rule_name) {
+            return Err(ConfigError::UnknownRule(rule_name.clone()));
+        }
+
+        let allowed = allowed_threshold_keys(rule_name);
+        let mut parsed_values = HashMap::new();
+
+        for (key, value) in threshold_values {
+            if !allowed.contains(&key.as_str()) {
+                return Err(ConfigError::Schema(format!(
+                    "unknown threshold key for {}: {}",
+                    rule_name, key
+                )));
+            }
+
+            let parsed = match value {
+                serde_yaml::Value::String(s) => Decimal::from_str(s).ok(),
+                serde_yaml::Value::Number(n) => Decimal::from_str(&n.to_string()).ok(),
+                _ => None,
+            }
+            .ok_or_else(|| {
+                ConfigError::Schema(format!(
+                    "threshold value must be decimal for {}.{}",
+                    rule_name, key
+                ))
+            })?;
+
+            parsed_values.insert(key.clone(), parsed);
+        }
+
+        out.insert(rule_name.clone(), parsed_values);
+    }
+
+    Ok(out)
 }
 
 pub fn load_and_validate_config(path: &Path, registry: &dyn RuleRegistry) -> Result<LoadConfig, ConfigError> {
@@ -2688,6 +1873,11 @@ pub fn load_and_validate_config(path: &Path, registry: &dyn RuleRegistry) -> Res
         }
     }
 
+    let negotiated_rules_version = negotiate_rules_config_version(raw.rules.version)?;
+    let parsed_rule_params = parse_rule_params(&raw.rules.params, &all_rules)?;
+    let mut parsed_thresholds = parse_rule_thresholds(&raw.rules.thresholds, &all_rules)?;
+    apply_threshold_overrides_from_params(&parsed_rule_params, &mut parsed_thresholds)?;
+
     let mut policies = Vec::new();
     if let Some(handling) = raw.handling {
         if let Some(raw_policies) = handling.policies {
@@ -2695,10 +1885,10 @@ pub fn load_and_validate_config(path: &Path, registry: &dyn RuleRegistry) -> Res
                 if !all_rules.contains(&p.rule_name) {
                     return Err(ConfigError::UnknownPolicyRule(p.rule_name));
                 }
+                let action = parse_policy_action(&p)?;
                 policies.push(PolicyConfig {
                     rule_name: p.rule_name,
-                    action: p.action,
-                    params: p.params,
+                    action,
                 });
             }
         }
@@ -2720,9 +1910,12 @@ pub fn load_and_validate_config(path: &Path, registry: &dyn RuleRegistry) -> Res
         corporate_actions,
         lifecycle_map,
         rules: RuleSwitchConfig {
+            version: negotiated_rules_version,
             enabled_categories: raw.rules.enabled_categories,
             enabled_rules: raw.rules.enabled_rules,
             disabled_rules: raw.rules.disabled_rules,
+            params: parsed_rule_params,
+            thresholds: parsed_thresholds,
         },
         handling: HandlingConfig { policies },
     })
@@ -2737,146 +1930,8 @@ fn resolve_config_path(base_dir: &Path, raw: &str) -> PathBuf {
     }
 }
 
-pub fn load_data(cfg: &LoadConfig) -> Result<LoadOutput, LoadStageError> {
-    match cfg.input.format {
-        InputFormat::Csv => load_csv_data(cfg),
-        InputFormat::Parquet => Err(LoadStageError::UnsupportedFormat("parquet".to_string())),
-    }
-}
-
-fn load_csv_data(cfg: &LoadConfig) -> Result<LoadOutput, LoadStageError> {
-    let path = &cfg.input.path;
-    if !path.exists() {
-        return Err(LoadStageError::OpenInput(path.display().to_string()));
-    }
-
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .from_path(path)
-        .map_err(|e| LoadStageError::CsvRead(e.to_string()))?;
-
-    let headers = reader
-        .headers()
-        .map_err(|e| LoadStageError::CsvRead(e.to_string()))?
-        .clone();
-
-    // Build header lookup once and pass to row parser.
-    let mut header_index = HashMap::new();
-    for (idx, col) in headers.iter().enumerate() {
-        header_index.insert(col.to_string(), idx);
-    }
-
-    let mut records = Vec::new();
-    let mut load_errors = Vec::new();
-    let mut total_rows = 0usize;
-
-    for (idx, row) in reader.records().enumerate() {
-        total_rows += 1;
-        let row_number = idx + 1;
-        match row {
-            Ok(rec) => match parse_csv_row(&rec, &header_index, &cfg.input.schema, row_number) {
-                Ok(parsed) => records.push(parsed),
-                Err(err) => load_errors.push(err),
-            },
-            Err(err) => load_errors.push(LoadError {
-                stage: "LOAD",
-                row_number,
-                raw_row: String::new(),
-                error_code: LoadErrorCode::ParseFail,
-                error_detail: err.to_string(),
-            }),
-        }
-    }
-
-    Ok(LoadOutput {
-        total_rows,
-        records,
-        load_errors,
-    })
-}
-
-fn parse_csv_row(
-    row: &csv::StringRecord,
-    header_index: &HashMap<String, usize>,
-    schema: &InputSchemaMap,
-    row_number: usize,
-) -> Result<Record, LoadError> {
-    // Keep original row for diagnostics so bad rows remain inspectable later.
-    let raw_row = row.iter().collect::<Vec<_>>().join(",");
-
-    let get = |column: &str| -> Result<&str, LoadError> {
-        let idx = header_index.get(column).copied().ok_or_else(|| LoadError {
-            stage: "LOAD",
-            row_number,
-            raw_row: raw_row.clone(),
-            error_code: LoadErrorCode::MissingField,
-            error_detail: format!("column not found in header: {column}"),
-        })?;
-
-        row.get(idx).ok_or_else(|| LoadError {
-            stage: "LOAD",
-            row_number,
-            raw_row: raw_row.clone(),
-            error_code: LoadErrorCode::MissingField,
-            error_detail: format!("missing value for column: {column}"),
-        })
-    };
-
-    let parse_decimal = |s: &str, field: &str| -> Result<Decimal, LoadError> {
-        Decimal::from_str(s).map_err(|_| LoadError {
-            stage: "LOAD",
-            row_number,
-            raw_row: raw_row.clone(),
-            error_code: LoadErrorCode::TypeCastFail,
-            error_detail: format!("invalid decimal for {field}: {s}"),
-        })
-    };
-
-    let parse_decimal_metric = |s: &str, field: &str| -> Result<Decimal, LoadError> {
-        Decimal::from_str(s).map_err(|_| LoadError {
-            stage: "LOAD",
-            row_number,
-            raw_row: raw_row.clone(),
-            error_code: LoadErrorCode::TypeCastFail,
-            error_detail: format!("invalid decimal for {field}: {s}"),
-        })
-    };
-
-    let date = get(&schema.date)?.to_string();
-    let ticker = get(&schema.ticker)?.to_string();
-
-    let open = parse_decimal(get(&schema.open)?, "open")?;
-    let high = parse_decimal(get(&schema.high)?, "high")?;
-    let low = parse_decimal(get(&schema.low)?, "low")?;
-    let close = parse_decimal(get(&schema.close)?, "close")?;
-    let vwap = parse_decimal(get(&schema.vwap)?, "vwap")?;
-
-    let volume = parse_decimal_metric(get(&schema.volume)?, "volume")?;
-    let turnover = parse_decimal_metric(get(&schema.turnover)?, "turnover")?;
-    // Some vendor datasets do not provide an explicit status column.
-    // Treat missing/blank status as NORMAL to keep loading resilient.
-    let status = header_index
-        .get(&schema.status)
-        .and_then(|idx| row.get(*idx))
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(TradeStatus::parse)
-        .unwrap_or(TradeStatus::Normal);
-
-    Ok(Record {
-        date,
-        ticker,
-        open,
-        high,
-        low,
-        close,
-        vwap,
-        volume,
-        turnover,
-        status,
-    })
-}
-
+mod loader;
+pub use loader::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PipelineStage {
     Load,

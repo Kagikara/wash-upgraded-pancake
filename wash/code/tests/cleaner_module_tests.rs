@@ -2,7 +2,7 @@ use rust_decimal::Decimal;
 use wash_load::{
     AuditActionSource, BuiltinPolicyExecutor, CleanerError, CleanerStage, DefaultCleanerStage,
     DefaultLoadErrorAuditMapper, HandlingConfig, Issue, IssueType, LoadError, LoadErrorCode,
-    NoopPolicyExecutor, PolicyConfig, Record, RuleNamePolicyResolver, TradeStatus,
+    NoopPolicyExecutor, PolicyAction, PolicyConfig, Record, RuleNamePolicyResolver, TradeStatus,
 };
 
 fn d(v: &str) -> Decimal {
@@ -52,8 +52,9 @@ fn cleaner_clones_records_and_merges_load_errors_into_audit() {
     let handling = HandlingConfig {
         policies: vec![PolicyConfig {
             rule_name: "NegativePriceRule".to_string(),
-            action: "set_literal".to_string(),
-            params: serde_yaml::from_str("value: '10.10'").expect("yaml"),
+            action: PolicyAction::SetLiteral {
+                value: "10.10".to_string(),
+            },
         }],
     };
 
@@ -136,12 +137,10 @@ fn cleaner_supports_clamp_field_action() {
     let handling = HandlingConfig {
         policies: vec![PolicyConfig {
             rule_name: "VwapRangeRule".to_string(),
-            action: "clamp_field".to_string(),
-            params: serde_yaml::from_str(
-                "min_field: low
-max_field: high",
-            )
-            .expect("yaml"),
+            action: PolicyAction::ClampField {
+                min_field: "low".to_string(),
+                max_field: "high".to_string(),
+            },
         }],
     };
 
@@ -170,8 +169,9 @@ fn cleaner_returns_unknown_field_error() {
     let handling = HandlingConfig {
         policies: vec![PolicyConfig {
             rule_name: "NegativePriceRule".to_string(),
-            action: "set_literal".to_string(),
-            params: serde_yaml::from_str("value: '10.10'").expect("yaml"),
+            action: PolicyAction::SetLiteral {
+                value: "10.10".to_string(),
+            },
         }],
     };
 
@@ -192,15 +192,17 @@ fn cleaner_returns_unknown_field_error() {
 }
 
 #[test]
-fn cleaner_returns_policy_error_on_unknown_action() {
+fn cleaner_returns_policy_error_on_invalid_clamp_field_params() {
     let input_records = vec![make_record("-1.00", "10.00")];
     let issue = make_issue();
 
     let handling = HandlingConfig {
         policies: vec![PolicyConfig {
             rule_name: "NegativePriceRule".to_string(),
-            action: "unknown_action".to_string(),
-            params: serde_yaml::from_str("{}").expect("yaml"),
+            action: PolicyAction::ClampField {
+                min_field: "ticker".to_string(),
+                max_field: "high".to_string(),
+            },
         }],
     };
 
@@ -212,11 +214,11 @@ fn cleaner_returns_policy_error_on_unknown_action() {
 
     let err = cleaner
         .run(&input_records, &[issue], &[], &handling)
-        .expect_err("should fail on unknown action");
+        .expect_err("should fail on non-decimal clamp field");
 
     match err {
         CleanerError::PolicyExecution { rule_name, .. } => {
-            assert_eq!(rule_name, "NegativePriceRule")
+            assert_eq!(rule_name, "PolicyParam")
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -230,8 +232,9 @@ fn cleaner_returns_policy_error_on_invalid_params() {
     let handling = HandlingConfig {
         policies: vec![PolicyConfig {
             rule_name: "NegativePriceRule".to_string(),
-            action: "set_literal".to_string(),
-            params: serde_yaml::from_str("{}").expect("yaml"),
+            action: PolicyAction::SetLiteral {
+                value: "not_a_decimal".to_string(),
+            },
         }],
     };
 
@@ -243,11 +246,11 @@ fn cleaner_returns_policy_error_on_invalid_params() {
 
     let err = cleaner
         .run(&input_records, &[issue], &[], &handling)
-        .expect_err("should fail on missing params.value");
+        .expect_err("should fail on invalid decimal literal");
 
     match err {
         CleanerError::PolicyExecution { rule_name, .. } => {
-            assert_eq!(rule_name, "NegativePriceRule")
+            assert_eq!(rule_name, "PolicyParam")
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -307,8 +310,9 @@ fn cleaner_mixed_matched_and_unmatched_issues_are_both_accounted_for() {
     let handling = HandlingConfig {
         policies: vec![PolicyConfig {
             rule_name: "NegativePriceRule".to_string(),
-            action: "set_literal".to_string(),
-            params: serde_yaml::from_str("value: '10.10'").expect("yaml"),
+            action: PolicyAction::SetLiteral {
+                value: "10.10".to_string(),
+            },
         }],
     };
 
@@ -357,8 +361,9 @@ fn cleaner_fails_fast_when_cleaned_row_breaks_open_positive_invariant() {
     let handling = HandlingConfig {
         policies: vec![PolicyConfig {
             rule_name: "ForceOpenZeroRule".to_string(),
-            action: "set_literal".to_string(),
-            params: serde_yaml::from_str("value: '0'").expect("yaml"),
+            action: PolicyAction::SetLiteral {
+                value: "0".to_string(),
+            },
         }],
     };
 

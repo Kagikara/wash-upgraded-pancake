@@ -106,6 +106,27 @@ cleaner --config config.yaml --review-output-dir output/review --output-dir outp
 - enabled_categories / enabled_rules / disabled_rules 控制启用范围
 - 仅产生 Issue，不修改数据
 
+### 扩展规则测试模板（新增）
+
+新增扩展规则时，建议直接复用 `wash/code/tests/common/rule_extension_template.rs` 中的模板宏：
+
+- 自动生成 4 类测试：
+   - 入参校验测试（参数类型与配置可加载性）
+   - 命中测试（应报问题的样本必须命中）
+   - 误报测试（正常样本不应误报）
+   - 性能基准测试（默认 `#[ignore]`，按需执行）
+
+示例可参考：`wash/code/tests/rule_extension_template_tests.rs`。
+执行方式：
+
+```bash
+cd wash/code
+cargo test --test rule_extension_template_tests
+
+# 运行包含性能基准在内的全部模板测试
+cargo test --test rule_extension_template_tests -- --ignored
+```
+
 ---
 
 ## 4. 人工核验阶段（Review Stage）

@@ -29,20 +29,39 @@ lifecycle_map:
   path: ../../data/lifecycle_map.yaml
 
 rules:
+  version: 1
   enabled_categories:
     - DataIntegrity
     - IntraBarLogic
   enabled_rules: []
   disabled_rules: []
+  params:
+    HighLowLogicRule:
+      epsilon: 0
+    NegativePriceRule:
+      min_allowed_price: 0
+    TickSizeRule:
+      remainder_tolerance: 0
+    VwapRangeRule:
+      tolerance: 0
+  thresholds:
+    HighLowLogicRule:
+      epsilon: 0
+    NegativePriceRule:
+      min_allowed_price: 0
+    TickSizeRule:
+      remainder_tolerance: 0
+    VwapRangeRule:
+      tolerance: 0
 
 handling:
   policies:
     - rule_name: VwapRangeRule
-      action: clamp_field
-      params:
+      action:
+        type: clamp_field
         min_field: low
         max_field: high
     - rule_name: HighLowLogicRule
-      action: set_literal
-      params:
+      action:
+        type: set_literal
         value: "0"

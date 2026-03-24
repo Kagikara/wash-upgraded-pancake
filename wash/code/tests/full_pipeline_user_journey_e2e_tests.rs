@@ -163,13 +163,13 @@ fn user_journey_review_then_full_pipeline_with_isolated_outputs() {
         "handling:".to_string(),
         "  policies:".to_string(),
         "    - rule_name: VwapRangeRule".to_string(),
-        "      action: clamp_field".to_string(),
-        "      params:".to_string(),
+        "      action:".to_string(),
+        "        type: clamp_field".to_string(),
         "        min_field: low".to_string(),
         "        max_field: high".to_string(),
         "    - rule_name: HighLowLogicRule".to_string(),
-        "      action: set_literal".to_string(),
-        "      params:".to_string(),
+        "      action:".to_string(),
+        "        type: set_literal".to_string(),
         "        value: '10.20'".to_string(),
     ]
     .join("\n");
