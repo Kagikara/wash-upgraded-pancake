@@ -9,8 +9,8 @@
     "processed_issues": 0,
     "unresolved_issues": 0,
     "disabled_issues": 0,
-    "total_time_ms": 418,
-    "throughput_rows_per_sec": 7526,
-    "rule_time_breakdown": {"DuplicateDatesRule":2,"HighLowLogicRule":0,"MissingDatesRule":361,"NegativePriceRule":0,"NonTradingDayRule":0,"TickSizeRule":0,"VwapRangeRule":0}
+    "total_time_ms": 357,
+    "throughput_rows_per_sec": 8812,
+    "rule_time_breakdown": {"DuplicateDatesRule":2,"HighLowLogicRule":0,"MissingDatesRule":308,"NegativePriceRule":0,"NonTradingDayRule":0,"TickSizeRule":0,"VwapRangeRule":0}
   }
 }
